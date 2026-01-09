@@ -51,13 +51,36 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
     groups = []
     temp = {}
     symSet = {}
+    lowerArm = 0
+    legLen = 0
     
-    modVarVals = ['faceDev', 'fat', 'muscle', 'devicciRatio']
-    for i in modVarVals:
-        tempRange = rand.random()
-    varValMap = {}
+    faceDev = {}
+    fat = {}
+    muscle = {}
+    
+    fatMods = ["armslegs/l-lowerarm-fat-decr|incr", "armslegs/l-lowerleg-fat-decr|incr", "armslegs/l-upperarm-fat-decr|incr", "armslegs/l-upperleg-fat-decr|incr", "armslegs/r-lowerarm-fat-decr|incr",
+               "armslegs/r-lowerleg-fat-decr|incr", "armslegs/r-upperarm-fat-decr|incr", "armslegs/r-upperleg-fat-decr|incr","head/head-fat-decr|incr,",
+    ]
+    muscleMods = ["armslegs/l-lowerarm-muscle-decr|incr", "armslegs/l-lowerleg-muscle-decr|incr", "armslegs/l-upperarm-muscle-decr|incr", "armslegs/l-upperarm-shoulder-muscle-decr|incr", "armslegs/l-upperleg-muscle-decr|incr",
+               "armslegs/r-lowerarm-muscle-decr|incr", "armslegs/r-lowerleg-muscle-decr|incr", "armslegs/r-upperarm-muscle-decr|incr", "armslegs/r-upperarm-shoulder-muscle-decr|incr","armslegs/r-upperleg-muscle-decr|incr",
+               "macrodetails-universal/Muscle", "torso/torso-muscle-dorsi-decr|incr", "torso/torso-muscle-pectoral-decr|incr",
+               ]
     
     
+    randFat = rand.uniform(-1, 1)
+    fatRangeVal = rand.uniform(.05, .2)
+    
+    temp1 = 0 - fatRangeVal
+    temp2 = 0 + fatRangeVal
+    
+    for i in fatMods:
+        fat[i] = rand.uniform(temp1, temp2)
+        
+    for x in muscleMods:
+        muscle[x] = rand.uniform(temp1, temp2)
+        
+        #                        Non-Oriented                                    #
+
 
     for modifier in modifiers:
         #removes white space
@@ -70,6 +93,7 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
         if nline[0] == 'l' or nline[0] == 'r':
             #dropping the orientation, ie: 'l', or 'r'
             tempName = tempLine[0] + '/' + '-' + nline[1] + '-' + nline[2] + '-' + nline[3]
+            
             if tempName in temp:
                 continue
             elif tempName not in temp:
@@ -78,9 +102,57 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
             
         else:
             noSymGroup.append(tempLine[0] + '/' + tempLine[1])
+            #find total height first:
+            
+            modVal1 = rand.uniform(parameter1, parameter2)
+            noSym["macrodetails-height/Height"] = modVal1
             for k in noSymGroup:
-                modVal = rand.uniform(parameter1, parameter2)
+                if k == "measure/measure-upperarm-length-decr|incr":
+                    temp = noSym["macrodetails-height/Height"]
+                    rangeArm = rand.uniform(.52, .55)
+                    #some random value between 52% and 55%
+                    modVal = (temp/2)
+                    lowerArm = 1 - rangeArm
+                    
+                elif k == "macrodetails-height/Height":
+                    #total height
+                    noSym["macrodetails-height/Height"] = rand.uniform(parameter1, parameter2)
+                    #should be some value between -1, 1, corresponding to a height between 4.9 - 8.2
+                
+                elif k == "measure/measure-lowerarm-length-decr|incr":
+                    modVal = lowerArm
+                
+                elif k == "macrodetails/Gender":
+                    genRand = rand.uniform(-1, 1)
+                    #-1 == female
+                    #+1 == male
+                    if genRand <= 0:
+                        legLen = rand.uniform(.49, .52)
+                    elif genRand >= 0:
+                        legLen = rand.uniform(.48, .51)
+                    modVal = genRand
+                
+                elif k== "armslegs/lowerlegs-height-decr|incr":
+                    lowLeg = legLen / 2
+                    modVal = lowLeg
+                
+                elif k == "measure/measure-upperleg-height-decr|incr":
+                    upLeg = legLen / 2
+                    modVal = upLeg
+                
+                elif k in fatMods:
+                    modVal = fat[k]
+                    continue
+                elif k in muscleMods:
+                    modVal = muscle[k]
+                
+                else:
+                    modVal = rand.uniform(parameter1, parameter2)
+                    continue
+                
                 noSym[k] = modVal
+    
+    #                        Oriented                                    #
     
     count = 0
     orient = ['l', 'r']
@@ -104,5 +176,3 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
         getMod = human.getModifier(key)
         tempValues = noSym.get(key)
         getMod.setValue(tempValues)
-        
-    
