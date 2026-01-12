@@ -75,8 +75,8 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
     randMuscle = rand.uniform(-1, 1)
     muscleRangeVal = rand.uniform(.05, .2)
     
-    tempMuscle1 = randFat - fatRangeVal
-    tempMuscle2 = randFat + fatRangeVal
+    tempMuscle1 = randMuscle - muscleRangeVal
+    tempMuscle2 = randMuscle + muscleRangeVal
     
     #random value within the appropriate range
     for i in fatMods:
@@ -85,7 +85,7 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
         
     for x in muscleMods:
         muscle[x] = rand.uniform(tempMuscle1, tempMuscle2)
-        finalSet[i] = muscle[i]
+        finalSet[x] = muscle[x]
         
     #find and set height value before any other modifiers:
     modHeight = rand.uniform(parameter1, parameter2)
@@ -94,14 +94,19 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
     finalSet["macrodetails-height/Height"] = noSym["macrodetails-height/Height"]
     
     #upper and lower arms
-    noSym["measure/measure-upperarm-length-decr|incr"] = (modHeight/2)
+    rangeArm = (modHeight/2)
+    rangeUpperArm = rand.uniform(.52, .55)
+    lowerArm = rangeArm - rangeUpperArm
+    
+    noSym["measure/measure-upperarm-length-decr|incr"] = rangeUpperArm
     presets.append("measure/measure-upperarm-length-decr|incr")
     finalSet["measure/measure-upperarm-length-decr|incr"] = noSym["measure/measure-upperarm-length-decr|incr"]
-    rangeArm = rand.uniform(.52, .55)
-    lowerArm = 1 - rangeArm
-    noSym["measure/measure-lowerarm-length-decr|incr"] = 1 - rangeArm
+    
+    
+    noSym["measure/measure-lowerarm-length-decr|incr"] = lowerArm
     presets.append("measure/measure-lowerarm-length-decr|incr")
     finalSet["measure/measure-lowerarm-length-decr|incr"] = noSym["measure/measure-lowerarm-length-decr|incr"]
+    
     #gender and gender assigned modifiers:
     genRand = rand.uniform(-1, 1)
                     #-1 == female
@@ -143,7 +148,7 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
             if tempName in temp:
                 #then nothing should happen, this value has already been assigned
                 symSet[storageName] = temp[tempName]
-                finalSet[storageName] = symSet[storageName]
+                finalSet[tempName] = symSet[storageName]
                 continue
                 
             #if the modifier has an orientation, and has not already
@@ -158,23 +163,24 @@ def findSymmetry(human, modifiers, parameter1, parameter2):
                 modVal = rand.uniform(parameter1, parameter2)
                 temp[tempName] = modVal
                 symSet[storageName] = modVal
-                finalSet[storageName] = symSet[storageName]
+                finalSet[tempName] = symSet[storageName]
         else:
             mod = rand.uniform(parameter1, parameter2)
-            temp[tempName] = modVal
-            finalSet[storageName] = temp[tempName]
+            temp[line] = mod
+            finalSet[line] = temp[line]
         
-        orient = ['l', 'r']
-        count = 0
-        for key in symSet:
-            tempLine1 = key.split('/')
-            nline1 = tempLine[1].split('-')
-            finalName = tempLine1[0] + '/' + orient[count] + '-' + nline1[1] + '-' + nline1[2] + '-' + nline1[3]
-            finalSet[finalName] = symSet[key]
-            count += 1
-            if count > 1:
-                count == 0
-                continue
+    orient = ['l', 'r']
+    count = 0
+    for key in symSet:
+        tempLine1 = key.split('/')
+        nline1 = tempLine[1].split('-')
+        finalName = tempLine1[0] + '/' + orient[count] + '-' + nline1[1] + '-' + nline1[2] + '-' + nline1[3]
+        finalSet[finalName] = symSet[key]
+        count += 1
+        
+        if count > 1:
+            count == 0
+            continue
         
         #assign modifiers
     for key in finalSet:
