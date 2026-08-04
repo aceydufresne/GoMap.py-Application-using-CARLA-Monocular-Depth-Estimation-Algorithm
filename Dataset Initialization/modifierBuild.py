@@ -39,6 +39,7 @@ def unload(app):
 
 def find(human,modifiers):
     
+    finalSet = {}
     #modifiers that must be set within a certain range of one another
     fatMods = ["armslegs/l-lowerarm-fat-decr|incr", "armslegs/l-lowerleg-fat-decr|incr", "armslegs/l-upperarm-fat-decr|incr", "armslegs/l-upperleg-fat-decr|incr", "armslegs/r-lowerarm-fat-decr|incr",
                "armslegs/r-lowerleg-fat-decr|incr", "armslegs/r-upperarm-fat-decr|incr", "armslegs/r-upperleg-fat-decr|incr","head/head-fat-decr|incr",
@@ -69,45 +70,66 @@ def find(human,modifiers):
         headHeight = heightVal/ heightRan
                 
     elif age > 10 and age < 14:
-        height = rand.uniform(6,7)
+        heightRan = rand.uniform(6,7)
         #male = true
         if sex == True:
         #in inches with bias to average height
-            heightVal = rand.triangular(59, 66, 70)
+            heightVal = rand.triangular(59, 70, 63)
             #female = false
         else:
-            heightVal = rand.triangular(51,63,67)
+            heightVal = rand.triangular(51,67,63)
         headHeight = heightVal/ heightRan
         
     else:
         if sex == True:
-            height = rand.uniform(7,8)
-            heigtVal = rand.triangular(60, 69, 84)
+            heightRan = rand.uniform(7,8)
+            heightVal = rand.triangular(60, 84, 69)
         else:
-            height.rand.uniform(7,8)
-            heightVal = rand.triangular(57, 64, 76)
+            heightRan = rand.uniform(7,8)
+            heightVal = rand.triangular(57, 76, 64)
         headHeight = heightVal / heightRan
     
     #determine height in MakeHumanAPI
     heightMod = human.getModifier("macrodetails-height/Height")
     maximumHeight = 96
     minimumHeight = 48
-    normalizedHeight = (heightVal - minimumHeight) / (maximumHeight - minimumHeight)
-    heightMod.setValue(normalizedHeight)
+    normalizedLegHeight = (heightVal - minimumHeight) / (maximumHeight - minimumHeight)
+    heightMod.setValue(normalizedLegHeight)
     
     #determining proportions of leg
-    totalLegLength = 4 * headHeightVal
+    totalLegLength = 4 * headHeight
     upperLegVal = rand.uniform(.46,.48)
     lowerLegVal = 1-upperLegVal
     upperLeg = upperLegVal * totalLegLength
-    lowerLeg = lowerLeg * totalLegLength
+    lowerLeg = lowerLegVal * totalLegLength
     
     if upperLegVal + lowerLegVal != 1:
         print("Error")
     else:
         upperLegMod = human.getModifier("armslegs/upperlegs-height-decr|incr")
-        upperLegMod.setValue(upperLegVal)
     
+        defaultValLeg = .47
+        minimumHeightUpperLeg = .40
+        maximumHeightUpperLeg = .54
+        if upperLegVal < defaultValLeg:
+            normalizedLegMod = (upperLegVal - defaultValLeg) / (defaultValLeg - minimumHeightUpperLeg)
+        else:
+            normalizedLegMod = (upperLegVal - defaultValLeg) / (maximumHeightUpperLeg - defaultValLeg)
+        upperLegMod.setValue(normalizedLegMod)
+    
+    #arms:
+    minimumHeightArm = 2.5
+    maximumHeightArm = 3.6
+    
+    totalArmRan = rand.uniform(2.5, 3.6)
+    totalArmVal = totalArmRan * headHeight
+    upperArmVal = rand.uniform(.5,.7)
+    lowerArmVal = 1 - upperArmVal
+    normalizedArmHeight = (totalArmRan - minimumHeightArm) / (maximumHeightArm - minimumHeightArm)
+    finalSet["armslegs/l-lowerarm-scale-vert-decr|incr"] = 
+    
+    for modifier in modifiers:
+        
 
 
 def test():
@@ -117,4 +139,4 @@ def test():
         output.write("createHuman loaded successfully")
 
     path = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/Dataset/example1.fbx"
-
+    
