@@ -3,6 +3,7 @@ import traceback
 from core import G
 import random as rand
 import re
+import math
 
 def load(app):
     human = G.app.selectedHuman
@@ -103,7 +104,7 @@ def find(human,modifiers):
     upperLeg = upperLegVal * totalLegLength
     lowerLeg = lowerLegVal * totalLegLength
     
-    if upperLegVal + lowerLegVal != 1:
+    if not math.isclose(upperLegVal + lowerLegVal, 1.0):
         print("Error")
     else:
         upperLegMod = human.getModifier("armslegs/upperlegs-height-decr|incr")
@@ -118,15 +119,22 @@ def find(human,modifiers):
         upperLegMod.setValue(normalizedLegMod)
     
     #arms:
+    #total arm length in head units
     minimumHeightArm = 2.5
     maximumHeightArm = 3.6
+    totalArmLengthVal = rand.uniform(2.5,3.6)
+    #lower arm:
+    lowerArmVal = rand.uniform(.45, .48)
+    lowerArm = totalArmLengthVal * lowerArmVal
+    #upper arm:
+    upperArmVal = 1 - lowerArmVal
+    upperArm = totalArmLengthVal * upperArmVal
     
-    totalArmRan = rand.uniform(2.5, 3.6)
-    totalArmVal = totalArmRan * headHeight
-    upperArmVal = rand.uniform(.5,.7)
-    lowerArmVal = 1 - upperArmVal
-    normalizedArmHeight = (totalArmRan - minimumHeightArm) / (maximumHeightArm - minimumHeightArm)
-    finalSet["armslegs/l-lowerarm-scale-vert-decr|incr"] = 
+    if not math.isclose(upperLegVal + lowerLegVal, 1.0):
+        print("Error in arms")
+    else:
+        
+    
     
     for modifier in modifiers:
         
