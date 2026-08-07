@@ -97,7 +97,7 @@ def find(human,modifiers):
     normalizedLegHeight = (heightVal - minimumHeight) / (maximumHeight - minimumHeight)
     heightMod.setValue(normalizedLegHeight)
     
-    #determining proportions of leg
+    #determining proportions of upper leg
     totalLegLength = 4 * headHeight
     upperLegVal = rand.uniform(.46,.48)
     lowerLegVal = 1-upperLegVal
@@ -117,6 +117,9 @@ def find(human,modifiers):
         else:
             normalizedLegMod = (upperLegVal - defaultValLeg) / (maximumHeightUpperLeg - defaultValLeg)
         upperLegMod.setValue(normalizedLegMod)
+        
+    #lower legs:
+        lowerLegMod = human.getModifier("armslegs/r-lowerarm-scale-vert-decr|incr")
     
     #arms:
     #total arm length in head units
@@ -133,7 +136,27 @@ def find(human,modifiers):
     if not math.isclose(upperLegVal + lowerLegVal, 1.0):
         print("Error in arms")
     else:
+        #lower arm value setting
+        lowerArmMod = human.getModifier("armslegs/l-lowerarm-scale-vert-decr|incr")
+        defaultValArmLower = .44
+        minimumHeightLowerArm = .42
+        maximumHeightLowerArm = .46
+        if lowerArmVal < defaultValArmLower:
+            normalizedArmModLower = (lowerArmVal - defaultValArmLower) / (defaultValArmLower - minimumHeightLowerArm)
+        else:
+            normalizedArmModLower = (lowerArmVal - defaultValArmLower) / (maximumHeightLowerArm - defaultValArmLower)
+        lowerArmMod.setValue(normalizedArmModLower)
+        #upper arm value setting
+        upperArmMod = human.getModifier("armslegs/l-upperarm-scale-vert-decr|incr")
+        defaultValArmUpper = .44
+        minimumHeightUpperArm = .42
+        maximumHeightUpperArm = .46
         
+        if upperArmVal < defaultValArmUpper:
+            normalizedArmModUpper = (upperArmVal - defaultValArmUpper) / (defaultValArmUpper - minimumHeightUpperArm)
+        else:
+            normalizedArmModUpper = (upperArmVal - defaultValArmUpper) / (maximumHeightUpperArm - defaultValArmUpper)
+        upperArmMod.setValue(normalizedArmModUpper)
     
     
     for modifier in modifiers:
