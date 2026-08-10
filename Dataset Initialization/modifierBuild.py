@@ -4,6 +4,7 @@ from core import G
 import random as rand
 import re
 import math
+from collections import defaultdict
 
 def load(app):
     human = G.app.selectedHuman
@@ -100,7 +101,7 @@ def find(human,modifiers):
     #determining proportions of upper leg
     totalLegLength = 4 * headHeight
     upperLegVal = rand.uniform(.46,.48)
-    lowerLegVal = 1-upperLegVal
+    lowerLegVal = 1.0-upperLegVal
     upperLeg = upperLegVal * totalLegLength
     lowerLeg = lowerLegVal * totalLegLength
     
@@ -120,7 +121,17 @@ def find(human,modifiers):
         
     #lower legs:
         lowerLegMod = human.getModifier("armslegs/r-lowerarm-scale-vert-decr|incr")
-    
+        defaultValLowerLeg = .53
+        minimumHeightLowerLeg = .46
+        maximumHeightLowerLeg = .6
+        
+        if lowerLegVal < defaultValLowerLeg:
+            normalizedLegModLower = ((lowerLegVal - defaultValLowerLeg) / (defaultValLowerLeg - minimumHeightLowerLeg))
+        else:
+            normalizedLegModLower = ((lowerLegVal - defaultValLowerLeg) / (maximumHeightLowerLeg - defaultValLowerLeg))
+            #no modifier for lower leg
+        #lowerLegMod.setValue(normalizedLegModLower)
+        
     #arms:
     #total arm length in head units
     minimumHeightArm = 2.5
@@ -130,10 +141,10 @@ def find(human,modifiers):
     lowerArmVal = rand.uniform(.45, .48)
     lowerArm = totalArmLengthVal * lowerArmVal
     #upper arm:
-    upperArmVal = 1 - lowerArmVal
+    upperArmVal = 1.0 - lowerArmVal
     upperArm = totalArmLengthVal * upperArmVal
     
-    if not math.isclose(upperLegVal + lowerLegVal, 1.0):
+    if not math.isclose(upperArmVal + lowerArmVal, 1.0):
         print("Error in arms")
     else:
         #lower arm value setting
@@ -148,21 +159,59 @@ def find(human,modifiers):
         lowerArmMod.setValue(normalizedArmModLower)
         #upper arm value setting
         upperArmMod = human.getModifier("armslegs/l-upperarm-scale-vert-decr|incr")
-        defaultValArmUpper = .44
-        minimumHeightUpperArm = .42
-        maximumHeightUpperArm = .46
-        
+        defaultValArmUpper = .56
+        minimumHeightUpperArm = .54
+        maximumHeightUpperArm = .58
         if upperArmVal < defaultValArmUpper:
-            normalizedArmModUpper = (upperArmVal - defaultValArmUpper) / (defaultValArmUpper - minimumHeightUpperArm)
+            normalizedArmModUpper = ((upperArmVal - defaultValArmUpper) / (defaultValArmUpper - minimumHeightUpperArm))
         else:
-            normalizedArmModUpper = (upperArmVal - defaultValArmUpper) / (maximumHeightUpperArm - defaultValArmUpper)
+            normalizedArmModUpper = ((upperArmVal - defaultValArmUpper) / (maximumHeightUpperArm - defaultValArmUpper))
         upperArmMod.setValue(normalizedArmModUpper)
     
-    
+    pairs = {}
+    orientMod = {}
+    nonOrientMod = []
     for modifier in modifiers:
+        #dictionary for 
+        sections = modifier.split(r'/')
+                ##armslegs/l-leg-valgus-decr|incr
+        #"armslegs" "l-leg-valgus-decr|incr"
+        #sections[1] == l-leg-valgus-decr|incr"
+        segments = sections[1].split("-", maxsplit=1)
+        ##"armslegs" "l" "leg-valgus-decr|incr"
+        modName = segments[1]
+        tempSeg = sections[1]
+        #"l"
+        orientLetter= tempSeg[:1]
+
+        if orientLetter == "l":
+            if  modName in orientMod:
+                orientMod[modName] += (modifier,)
+            else:
+                orientMod[modName] = (modifier)
+        elif orientLetter == "r":
+            if modName in orientMod:
+                orientMod[modName] += (modifier,)
+            else:
+                orientMod[modName] = (modifier)
+        else:
+            nonOrientMod.append(modifier)
+    
+    maxVal = 1
+    avgVal = 0
+    minVal = -1
+    finalSet = {}
+    for key,val in orientMod.items():
+        mod1,mod2 = val
+        tempRan = rand.triangular(minVal, maxVal, avgVal)
+        finalSet[mod1] = tempRan
+        finalSet[mod2] = tempRan
+        if finalSet[mod1] != finalSet[mod2]:
+            print("error in modifier assignment")
+        else:
+            continue
+    
         
-
-
 def test():
     testPath = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/Dataset/test.txt"
 
@@ -170,4 +219,3 @@ def test():
         output.write("createHuman loaded successfully")
 
     path = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/Dataset/example1.fbx"
-    
