@@ -65,6 +65,11 @@ def find(human,modifiers):
     height = 0
     sex = rand.choice([True, False])
     
+    genderModifier = human.getModifier("macrodetails/Gender")
+    genderValue = 1.0 if sex else 0.0
+    genderModifier.setValue(genderValue)
+    human.setAgeYears(age)
+    
     if age <= 10:
         #young children have a height ratio of around 6 heads
         heightRan = rand.uniform(5,6)
@@ -168,11 +173,35 @@ def find(human,modifiers):
             normalizedArmModUpper = ((upperArmVal - defaultValArmUpper) / (maximumHeightUpperArm - defaultValArmUpper))
         upperArmMod.setValue(normalizedArmModUpper)
     
-    pairs = {}
+    pairs = []
     orientMod = {}
     nonOrientMod = []
+    specialCase = {
+        "macrodetails/Gender",
+        "macrodetails/Age",
+        "macrodetails-height/Height",
+        "armslegs/upperlegs-height-decr|incr",
+        "armslegs/lowerlegs-height-decr|incr",
+        "armslegs/l-lowerarm-scale-vert-decr|incr",
+        "armslegs/r-lowerarm-scale-vert-decr|incr",
+        "armslegs/l-upperarm-scale-vert-decr|incr",
+        "armslegs/r-upperarm-scale-vert-decr|incr",
+}
+    
+    
+    
     for modifier in modifiers:
-        #dictionary for 
+        
+        if modifier in specialCase:
+            continue
+        
+        #check if the modifier uses the range -1,1 or 0,1
+        #if "|" in modifier:
+        #    pairs.append(modifier)
+        #else:
+        #    specialCase.append(modifier)
+        
+        #dictionary for
         sections = modifier.split(r'/')
                 ##armslegs/l-leg-valgus-decr|incr
         #"armslegs" "l-leg-valgus-decr|incr"
@@ -183,35 +212,74 @@ def find(human,modifiers):
         tempSeg = sections[1]
         #"l"
         orientLetter= tempSeg[:1]
+        sanityLetter = tempSeg[1]
+        
 
-        if orientLetter == "l":
+        if orientLetter == "l" and sanityLetter == "-":
             if  modName in orientMod:
                 orientMod[modName] += (modifier,)
             else:
-                orientMod[modName] = (modifier)
-        elif orientLetter == "r":
+                orientMod[modName] = (modifier,)
+        elif orientLetter == "r" and sanityLetter == "-":
             if modName in orientMod:
                 orientMod[modName] += (modifier,)
             else:
-                orientMod[modName] = (modifier)
+                orientMod[modName] = (modifier,)
         else:
-            nonOrientMod.append(modifier)
+            nonOrientMod.append(modifier,)
     
+    specialMax = 1.0
+    specialMin = 0.0
     maxVal = 1
     avgVal = 0
     minVal = -1
     finalSet = {}
     for key,val in orientMod.items():
-        mod1,mod2 = val
-        tempRan = rand.triangular(minVal, maxVal, avgVal)
+        
+        try:
+            mod1,mod2 = val
+        except ValueError:
+            print(key)
+        
+        tempMod1 = human.getModifier(mod1)
+        tempMod2 = human.getModifier(mod2)
+        tempMin = max(tempMod1.getMin(), tempMod2.getMin())
+        tempMax = min(tempMod1.getMax(), tempMod2.getMax())
+        
+        if mod1 in specialCase or mod2 in specialCase:
+            tempRan = rand.uniform(tempMin, tempMax)
+        
+        else:
+        
+            tempRan = rand.triangular(tempMin, tempMax, 0.0)
         finalSet[mod1] = tempRan
         finalSet[mod2] = tempRan
         if finalSet[mod1] != finalSet[mod2]:
             print("error in modifier assignment")
-        else:
             continue
-    
         
+    
+    for key,val in finalSet.items():
+        tempMod = human.getModifier(key)
+        tempMod.setValue(val)
+    for mod in nonOrientMod:
+        tempMod = human.getModifier(mod)
+        tempMin = tempMod.getMin()
+        tempMax = tempMod.getMax()
+
+        if tempMin >= 0.0:
+            continue
+
+        mode = max(tempMin, min(0.0, tempMax))
+        modVal = rand.triangular(tempMin, tempMax, mode)
+        tempMod.setValue(modVal)
+    
+    #muscle and fat assignment:
+    
+    
+    
+    
+    
 def test():
     testPath = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/Dataset/test.txt"
 
@@ -219,3 +287,4 @@ def test():
         output.write("createHuman loaded successfully")
 
     path = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/Dataset/example1.fbx"
+    
