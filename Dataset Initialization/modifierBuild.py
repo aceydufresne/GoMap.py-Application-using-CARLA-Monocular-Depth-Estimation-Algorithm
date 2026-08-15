@@ -145,10 +145,7 @@ def find(human,modifiers):
         minimum = max(tempSet1.getMin(), tempSet2.getMin())
         maximum = min(tempSet1.getMax(), tempSet2.getMax())
 
-        muscleValue = max(
-            minimum,
-            min(maximum, muscleValue)
-        )
+        muscleValue = max(minimum,min(maximum, muscleValue))
         tempSet1.setValue(muscleValue)
         tempSet2.setValue(muscleValue)
 
@@ -159,12 +156,63 @@ def find(human,modifiers):
         variation = rand.uniform(-0.15, 0.15)
         muscleValue = baseMuscle + variation
 
-        muscleValue = max(
-            mod.getMin(),
-            min(mod.getMax(), muscleValue)
-        )
-
+        muscleValue = max(mod.getMin(),min(mod.getMax(), muscleValue))
         mod.setValue(muscleValue)
+
+    
+    globalFat = human.getModifier("macrodetails-universal/Weight")
+    value = max(globalFat.getMin(),min(globalFat.getMax(), baseFat))
+    globalFat.setValue(value)
+    
+    fatMap = {}
+    nonOrientedFat = []
+    
+    for modifier in fatMods:
+        if modifier == "macrodetails-universal/Weight":
+            continue
+        sections = modifier.split("/")
+        tempSeg = sections[1]
+        orientLetter = tempSeg[0]
+        sanityLetter = tempSeg[1]
+
+        if orientLetter in ("l", "r") and sanityLetter == "-":
+            segments = tempSeg.split("-", maxsplit=1)
+            modName = segments[1]
+
+            if modName in fatMap:
+                fatMap[modName] += (modifier,)
+            else:
+                fatMap[modName] = (modifier,)
+        else:
+            nonOrientedFat.append(modifier)
+    
+        for key, value in fatMap.items():
+            if len(value) != 2:
+                print("Missing muscle pair:", key)
+                continue
+
+            tempMod1, tempMod2 = value
+            tempSet1 = human.getModifier(tempMod1)
+            tempSet2 = human.getModifier(tempMod2)
+
+
+            variation = rand.uniform(-0.15, 0.15)
+            fatValue = baseFat + variation
+
+            minimum = max(tempSet1.getMin(), tempSet2.getMin())
+            maximum = min(tempSet1.getMax(), tempSet2.getMax())
+
+            muscleValue = max(minimum,min(maximum, fatValue))
+            tempSet1.setValue(fatValue)
+            tempSet2.setValue(fatValue)
+
+    for modifier in nonOrientedFat:
+
+        mod = human.getModifier(modifier)
+        variation = rand.uniform(-0.15, 0.15)
+        fatValue = baseFat + variation
+        fatValue = max(mod.getMin(),min(mod.getMax(), fatValue))
+        mod.setValue(fatValue)
 
 
     if age <= 10:
