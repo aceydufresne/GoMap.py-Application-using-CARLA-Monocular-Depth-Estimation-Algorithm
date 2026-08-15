@@ -70,6 +70,103 @@ def find(human,modifiers):
     genderModifier.setValue(genderValue)
     human.setAgeYears(age)
     
+        #muscle and fat assignment:
+# after age and sex have been selected
+
+    if age <= 10:
+        baseMuscle = rand.uniform(-0.8, -0.4)
+        baseFat = rand.uniform(-0.2, 0.4)
+
+    elif age < 14:
+        if sex:
+            baseMuscle = rand.uniform(-0.5, 0.1)
+            baseFat = rand.uniform(-0.3, 0.3)
+        else:
+            baseMuscle = rand.uniform(-0.6, 0.0)
+            baseFat = rand.uniform(-0.2, 0.4)
+
+    elif age < 50:
+        if sex:
+            baseMuscle = rand.uniform(-0.2, 0.7)
+            baseFat = rand.uniform(-0.4, 0.5)
+        else:
+            baseMuscle = rand.uniform(-0.3, 0.5)
+            baseFat = rand.uniform(-0.2, 0.6)
+
+    else:
+        if sex:
+            baseMuscle = rand.uniform(-0.5, 0.4)
+            baseFat = rand.uniform(-0.2, 0.6)
+        else:
+            baseMuscle = rand.uniform(-0.6, 0.3)
+            baseFat = rand.uniform(-0.1, 0.7)
+            
+    globalMuscle = human.getModifier("macrodetails-universal/Muscle")
+
+    value = max(globalMuscle.getMin(),min(globalMuscle.getMax(), baseMuscle))
+    globalMuscle.setValue(value)
+    
+    muscleMap = {}
+    nonOrientMuscle = []
+
+    for modifier in muscleMods:
+        if modifier == "macrodetails-universal/Muscle":
+            continue
+
+        sections = modifier.split("/")
+        tempSeg = sections[1]
+        orientLetter = tempSeg[0]
+        sanityLetter = tempSeg[1]
+
+        if orientLetter in ("l", "r") and sanityLetter == "-":
+            segments = tempSeg.split("-", maxsplit=1)
+            modName = segments[1]
+
+            if modName in muscleMap:
+                muscleMap[modName] += (modifier,)
+            else:
+                muscleMap[modName] = (modifier,)
+        else:
+            nonOrientMuscle.append(modifier)
+
+    for key, value in muscleMap.items():
+
+        if len(value) != 2:
+            print("Missing muscle pair:", key)
+            continue
+
+        tempMod1, tempMod2 = value
+        tempSet1 = human.getModifier(tempMod1)
+        tempSet2 = human.getModifier(tempMod2)
+
+        variation = rand.uniform(-0.15, 0.15)
+        muscleValue = baseMuscle + variation
+
+        minimum = max(tempSet1.getMin(), tempSet2.getMin())
+        maximum = min(tempSet1.getMax(), tempSet2.getMax())
+
+        muscleValue = max(
+            minimum,
+            min(maximum, muscleValue)
+        )
+        tempSet1.setValue(muscleValue)
+        tempSet2.setValue(muscleValue)
+
+    for modifier in nonOrientMuscle:
+
+        mod = human.getModifier(modifier)
+
+        variation = rand.uniform(-0.15, 0.15)
+        muscleValue = baseMuscle + variation
+
+        muscleValue = max(
+            mod.getMin(),
+            min(mod.getMax(), muscleValue)
+        )
+
+        mod.setValue(muscleValue)
+
+
     if age <= 10:
         #young children have a height ratio of around 6 heads
         heightRan = rand.uniform(5,6)
@@ -187,7 +284,8 @@ def find(human,modifiers):
         "armslegs/l-upperarm-scale-vert-decr|incr",
         "armslegs/r-upperarm-scale-vert-decr|incr",
 }
-    
+    specialCase.update(fatMods)
+    specialCase.update(muscleMods)
     
     
     for modifier in modifiers:
@@ -274,9 +372,7 @@ def find(human,modifiers):
         modVal = rand.triangular(tempMin, tempMax, mode)
         tempMod.setValue(modVal)
     
-    #muscle and fat assignment:
-    
-    
+
     
     
     
