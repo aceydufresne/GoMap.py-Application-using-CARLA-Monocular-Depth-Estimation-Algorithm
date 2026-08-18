@@ -1,0 +1,57 @@
+{
+    "realtimeUpdates": true,
+    "realtimeFitting": true,
+    "sliderImages": true,
+    "excludePlugins": [
+        "7_data",
+        "7_example",
+        "7_material_editor",
+        "7_profile",
+        "7_scene_editor",
+        "7_shell",
+        "7_targets",
+        "7_save_targets"
+    ],
+    "activeUserPlugins": [
+	 "modifierBuild"
+],
+    "rtl": false,
+    "invertMouseWheel": false,
+    "lowspeed": 1,
+    "preloadTargets": true,
+    "cameraAutoZoom": false,
+    "language": "english",
+    "highspeed": 5,
+    "realtimeNormalUpdates": false,
+    "units": "metric",
+    "real_weight": false,
+    "guiTheme": "makehuman",
+    "restoreWindowSize": true,
+    "windowGeometry": {
+        "width": 3840,
+        "height": 2066,
+        "x": -1,
+        "y": -11,
+        "state": [
+            "maximized"
+        ]
+    },
+    "useHDPI": false,
+    "noShaders": false,
+    "noSampleBuffers": false,
+    "tagFilterMode": "OR",
+    "useNameTags": false,
+    "tagCount": 5,
+    "makehumanTags": [
+        "makehuman™"
+    ],
+    "keepCustomValues": false,
+    "loaddir": "C:/Users/Acey/Documents/makehuman/v1py3/models",
+    "savedir": "C:/Users/Acey/Documents/makehuman/v1py3",
+    "exportdir": "C:/Users/Acey/Downloads",
+    "rendering_width": 800,
+    "rendering_height": 600,
+    "GL_RENDERER_SSS": false,
+    "GL_RENDERER_AA": true,
+    "version": "1.2.0"
+}
