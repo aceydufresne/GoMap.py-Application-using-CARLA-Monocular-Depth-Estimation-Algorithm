@@ -7,6 +7,9 @@ import math
 from collections import defaultdict
 
 def load(app):
+    print(">>>>>>>> CREATE HUMAN PLUGIN LOADED <<<<<<<<")
+    test()
+    
     human = G.app.selectedHuman
     varList = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/VariablesList.txt"
     modifiers = []
@@ -31,8 +34,13 @@ def load(app):
     results = find(human,modifiers)
 
     #final export of model
-    exporter = G.app.getExporter("fbx")
-    exporter.export(human, path)
+    human.applyAllTargets()
+
+    export_task = app.getCategory("Files").getTaskByName("Export")
+    exporter = export_task.getExporter("Filmbox (fbx)")
+
+    base_path = os.path.splitext(path)[0]
+    exporter.export(human, lambda extension: base_path + "." + extension)
 
 
 def unload(app):
