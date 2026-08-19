@@ -5,16 +5,23 @@ import random as rand
 import re
 import math
 from collections import defaultdict
+import getpath
+import skeleton as mh_skeleton
 
 def load(app):
-    print(">>>>>>>> CREATE HUMAN PLUGIN LOADED <<<<<<<<")
-    test()
-    
+        
     human = G.app.selectedHuman
     varList = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/VariablesList.txt"
     modifiers = []
     #example, change on completion
     path = "C:/Users/Acey/Documents/makehuman/v1py3/plugins/Dataset/example1.fbx"
+    
+    #first dataset inititalization
+    OUTPUT_DIRECTORY = (
+    "C:/Users/Acey/Documents/makehuman/"
+    "v1py3/plugins/Dataset/unclothed"
+)
+    
     
     #begin sorting the modifiers
     try:
@@ -31,23 +38,124 @@ def load(app):
         print(f"'{varList}' is not working")
     except Exception as e:
         print(f"error: '{e}'")
-    results = find(human,modifiers)
+    
+    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
 
-    #final export of model
-    human.applyAllTargets()
+    exportTask = app.getCategory("Files").getTaskByName("Export")
+    exporter = exportTask.getExporter("Filmbox (fbx)")
 
-    export_task = app.getCategory("Files").getTaskByName("Export")
-    exporter = export_task.getExporter("Filmbox (fbx)")
+    baselineValues = {
+        name: human.getModifier(name).getValue()
+        for name in modifiers
+    }
 
-    base_path = os.path.splitext(path)[0]
-    exporter.export(human, lambda extension: base_path + "." + extension)
+    successfulExports = 0
+    setSize = 100
+    for index in range(1, setSize + 1):
+        try:
+            restoreModifierValues(human, baselineValues)
+            find(human, modifiers)
+
+            human.applyAllTargets()
+
+            assignSkeleton(human)
+
+            filename = "human_{:04d}".format(index)
+            basePath = os.path.join(
+                OUTPUT_DIRECTORY,
+                filename
+            )
+
+            exporter.export(
+                human,
+                lambda extension, path=basePath:
+                    path + "." + extension
+            )
+
+            successfulExports += 1
+            print(
+                "Exported {}/{}: {}.fbx".format(
+                    index,
+                    setSize,
+                    basePath
+                )
+            )
+
+        except Exception:
+            print("Failed to generate human:", index)
+            traceback.print_exc()
+
+    print(
+        "Finished: {}/{} exported".format(
+            successfulExports,
+            setSize
+        )
+    )
 
 
 def unload(app):
     pass
 
 
+def restoreModifierValues(human, baselineValues):
+    human.blockEthnicUpdates = True
+
+    try:
+        for name, value in baselineValues.items():
+            human.getModifier(name).setValue(value)
+    finally:
+        human.blockEthnicUpdates = False
+
+
+def assignSkeleton(human, rigFilename="default.mhskel"):
+    rigPath = getpath.getSysDataPath(
+        os.path.join("rigs", rigFilename)
+    )
+
+    rig = mh_skeleton.load(rigPath, human.meshData)
+    human.setSkeleton(rig)
+
+    if human.getSkeleton() is None:
+        raise RuntimeError(f"Failed to load skeleton: {rigPath}")
+
+    print("Using skeleton:", rigFilename)
+    
+
+
 def find(human,modifiers):
+    
+    #rig:
+    #enthinicity:
+
+    alpha = 2.0
+
+    rawAfrican = rand.gammavariate(alpha, 1.0)
+    rawAsian = rand.gammavariate(alpha, 1.0)
+    rawCaucasian = rand.gammavariate(alpha, 1.0)
+
+    total = rawAfrican + rawAsian + rawCaucasian
+
+    africanRatio = rawAfrican / total
+    asianRatio = rawAsian / total
+    caucasianRatio = rawCaucasian / total
+
+    human.blockEthnicUpdates = True
+
+    try:
+        human.getModifier(
+            "macrodetails/African"
+        ).setValue(africanRatio)
+
+        human.getModifier(
+            "macrodetails/Asian"
+        ).setValue(asianRatio)
+
+        human.getModifier(
+            "macrodetails/Caucasian"
+        ).setValue(caucasianRatio)
+    finally:
+        human.blockEthnicUpdates = False
+    
     
     finalSet = {}
     #modifiers that must be set within a certain range of one another
@@ -109,10 +217,15 @@ def find(human,modifiers):
             baseMuscle = rand.uniform(-0.6, 0.3)
             baseFat = rand.uniform(-0.1, 0.7)
             
-    globalMuscle = human.getModifier("macrodetails-universal/Muscle")
+    globalMuscleValue = (baseMuscle + 1.0) / 2.0
 
-    value = max(globalMuscle.getMin(),min(globalMuscle.getMax(), baseMuscle))
-    globalMuscle.setValue(value)
+    globalMuscle = human.getModifier(
+        "macrodetails-universal/Muscle"
+    )
+
+    globalMuscleValue = max(globalMuscle.getMin(),min(globalMuscle.getMax(), globalMuscleValue))
+
+    globalMuscle.setValue(globalMuscleValue)
     
     muscleMap = {}
     nonOrientMuscle = []
@@ -167,10 +280,16 @@ def find(human,modifiers):
         muscleValue = max(mod.getMin(),min(mod.getMax(), muscleValue))
         mod.setValue(muscleValue)
 
-    
-    globalFat = human.getModifier("macrodetails-universal/Weight")
-    value = max(globalFat.getMin(),min(globalFat.getMax(), baseFat))
-    globalFat.setValue(value)
+
+    globalFatValue = (baseFat + 1.0) / 2.0
+
+    globalFat = human.getModifier(
+        "macrodetails-universal/Weight"
+    )
+
+    globalFatValue = max(globalFat.getMin(),min(globalFat.getMax(), globalFatValue))
+
+    globalFat.setValue(globalFatValue)
     
     fatMap = {}
     nonOrientedFat = []
@@ -194,25 +313,25 @@ def find(human,modifiers):
         else:
             nonOrientedFat.append(modifier)
     
-        for key, value in fatMap.items():
-            if len(value) != 2:
-                print("Missing muscle pair:", key)
-                continue
+    for key, value in fatMap.items():
+        if len(value) != 2:
+            print("Missing muscle pair:", key)
+            continue
 
-            tempMod1, tempMod2 = value
-            tempSet1 = human.getModifier(tempMod1)
-            tempSet2 = human.getModifier(tempMod2)
+        tempMod1, tempMod2 = value
+        tempSet1 = human.getModifier(tempMod1)
+        tempSet2 = human.getModifier(tempMod2)
 
 
-            variation = rand.uniform(-0.15, 0.15)
-            fatValue = baseFat + variation
+        variation = rand.uniform(-0.15, 0.15)
+        fatValue = baseFat + variation
 
-            minimum = max(tempSet1.getMin(), tempSet2.getMin())
-            maximum = min(tempSet1.getMax(), tempSet2.getMax())
+        minimum = max(tempSet1.getMin(), tempSet2.getMin())
+        maximum = min(tempSet1.getMax(), tempSet2.getMax())
 
-            muscleValue = max(minimum,min(maximum, fatValue))
-            tempSet1.setValue(fatValue)
-            tempSet2.setValue(fatValue)
+        muscleValue = max(minimum,min(maximum, fatValue))
+        tempSet1.setValue(fatValue)
+        tempSet2.setValue(fatValue)
 
     for modifier in nonOrientedFat:
 
@@ -278,7 +397,8 @@ def find(human,modifiers):
         upperLegMod.setValue(normalizedLegMod)
         
     #lower legs:
-        lowerLegMod = human.getModifier("armslegs/r-lowerarm-scale-vert-decr|incr")
+        lowerLegModR = human.getModifier("armslegs/r-lowerarm-scale-vert-decr|incr")
+        lowerLegModL = human.getModifier("armslegs/r-lowerarm-scale-vert-decr|incr")
         defaultValLowerLeg = .53
         minimumHeightLowerLeg = .46
         maximumHeightLowerLeg = .6
@@ -292,39 +412,49 @@ def find(human,modifiers):
         
     #arms:
     #total arm length in head units
-    minimumHeightArm = 2.5
-    maximumHeightArm = 3.6
-    totalArmLengthVal = rand.uniform(2.5,3.6)
-    #lower arm:
-    lowerArmVal = rand.uniform(.45, .48)
-    lowerArm = totalArmLengthVal * lowerArmVal
-    #upper arm:
-    upperArmVal = 1.0 - lowerArmVal
-    upperArm = totalArmLengthVal * upperArmVal
+    totalArmLengthHeads = rand.uniform(2.7, 3.6)
+    #height in inches
+    lowerArmVal = rand.uniform(.42, .48)
+    lowerArmLengthHeads = lowerArmVal * totalArmLengthHeads
+    upperArmVal = 1 - lowerArmVal
+    upperArmLengthHeads = upperArmVal * totalArmLengthHeads
+    
     
     if not math.isclose(upperArmVal + lowerArmVal, 1.0):
         print("Error in arms")
     else:
         #lower arm value setting
-        lowerArmMod = human.getModifier("armslegs/l-lowerarm-scale-vert-decr|incr")
-        defaultValArmLower = .44
+        lowerArmModL = human.getModifier("armslegs/l-lowerarm-scale-horiz-decr|incr")
+        lowerArmModR = human.getModifier("armslegs/r-lowerarm-scale-horiz-decr|incr")
+        measureLowerArmMod = human.getModifier("measure/measure-lowerarm-length-decr|incr")
+        defaultValArmLower = .45
         minimumHeightLowerArm = .42
-        maximumHeightLowerArm = .46
+        maximumHeightLowerArm = .48
         if lowerArmVal < defaultValArmLower:
             normalizedArmModLower = (lowerArmVal - defaultValArmLower) / (defaultValArmLower - minimumHeightLowerArm)
         else:
             normalizedArmModLower = (lowerArmVal - defaultValArmLower) / (maximumHeightLowerArm - defaultValArmLower)
-        lowerArmMod.setValue(normalizedArmModLower)
+            
+            #both modifiers will work, but use the measure modifier
+        #lowerArmModL.setValue(normalizedArmModLower)
+        #lowerArmModR.setValue(normalizedArmModLower)
+        measureLowerArmMod.setValue(normalizedArmModLower)
+        
         #upper arm value setting
-        upperArmMod = human.getModifier("armslegs/l-upperarm-scale-vert-decr|incr")
-        defaultValArmUpper = .56
-        minimumHeightUpperArm = .54
+        upperArmModL = human.getModifier("armslegs/l-upperarm-scale-horiz-decr|incr")
+        upperArmModR = human.getModifier("armslegs/r-upperarm-scale-horiz-decr|incr")
+        measureArmMod = human.getModifier("measure/measure-upperarm-length-decr|incr")
+        defaultValArmUpper = .55
+        minimumHeightUpperArm = .52
         maximumHeightUpperArm = .58
         if upperArmVal < defaultValArmUpper:
             normalizedArmModUpper = ((upperArmVal - defaultValArmUpper) / (defaultValArmUpper - minimumHeightUpperArm))
         else:
             normalizedArmModUpper = ((upperArmVal - defaultValArmUpper) / (maximumHeightUpperArm - defaultValArmUpper))
-        upperArmMod.setValue(normalizedArmModUpper)
+            #both modifiers will work, but use the measure modifier
+        #upperArmModL.setValue(normalizedArmModUpper)
+        #upperArmModR.setValue(normalizedArmModUpper)
+        measureArmMod.setValue(normalizedArmModUpper)
     
     pairs = []
     orientMod = {}
@@ -339,15 +469,45 @@ def find(human,modifiers):
         "armslegs/r-lowerarm-scale-vert-decr|incr",
         "armslegs/l-upperarm-scale-vert-decr|incr",
         "armslegs/r-upperarm-scale-vert-decr|incr",
+        "measure/measure-upperarm-length-decr|incr",
+        "measure/measure-lowerarm-length-decr|incr",
+        "macrodetails/Caucasian",
+        "macrodetails/Asian",
+        "macrodetails/African"
 }
     specialCase.update(fatMods)
     specialCase.update(muscleMods)
     
-    
     for modifier in modifiers:
-        
         if modifier in specialCase:
             continue
+
+        sections = modifier.split("/", maxsplit=1)
+
+        if len(sections) != 2:
+            print("Invalid modifier name:", modifier)
+            continue
+
+        tempSeg = sections[1]
+
+        # Only left/right modifiers have the l- or r- prefix.
+        if (
+            len(tempSeg) >= 3
+            and tempSeg[0] in ("l", "r")
+            and tempSeg[1] == "-"
+        ):
+            modName = tempSeg[2:]
+
+            if modName in orientMod:
+                orientMod[modName] += (modifier,)
+            else:
+                orientMod[modName] = (modifier,)
+        else:
+            nonOrientMod.append(modifier)
+    #for modifier in modifiers:
+        
+        #if modifier in specialCase:
+         #   continue
         
         #check if the modifier uses the range -1,1 or 0,1
         #if "|" in modifier:
@@ -356,31 +516,31 @@ def find(human,modifiers):
         #    specialCase.append(modifier)
         
         #dictionary for
-        sections = modifier.split(r'/')
+        #sections = modifier.split(r'/')
                 ##armslegs/l-leg-valgus-decr|incr
         #"armslegs" "l-leg-valgus-decr|incr"
         #sections[1] == l-leg-valgus-decr|incr"
-        segments = sections[1].split("-", maxsplit=1)
+        #segments = sections[1].split("-", maxsplit=1)
         ##"armslegs" "l" "leg-valgus-decr|incr"
-        modName = segments[1]
-        tempSeg = sections[1]
+        #modName = segments[1]
+        #tempSeg = sections[1]
         #"l"
-        orientLetter= tempSeg[:1]
-        sanityLetter = tempSeg[1]
+        #orientLetter= tempSeg[:1]
+        #sanityLetter = tempSeg[1]
         
 
-        if orientLetter == "l" and sanityLetter == "-":
-            if  modName in orientMod:
-                orientMod[modName] += (modifier,)
-            else:
-                orientMod[modName] = (modifier,)
-        elif orientLetter == "r" and sanityLetter == "-":
-            if modName in orientMod:
-                orientMod[modName] += (modifier,)
-            else:
-                orientMod[modName] = (modifier,)
-        else:
-            nonOrientMod.append(modifier,)
+        #if orientLetter == "l" and sanityLetter == "-":
+            #if  modName in orientMod:
+           #     orientMod[modName] += (modifier,)
+          #  else:
+         #       orientMod[modName] = (modifier,)
+        #elif orientLetter == "r" and sanityLetter == "-":
+           # if modName in orientMod:
+             #   orientMod[modName] += (modifier,)
+            #else:
+                #orientMod[modName] = (modifier,)
+        #else:
+            #nonOrientMod.append(modifier,)
     
     specialMax = 1.0
     specialMin = 0.0
@@ -390,10 +550,11 @@ def find(human,modifiers):
     finalSet = {}
     for key,val in orientMod.items():
         
-        try:
-            mod1,mod2 = val
-        except ValueError:
-            print(key)
+        if len(val) != 2:
+            print("Missing modifier pair:", key, val)
+            continue
+
+        mod1, mod2 = val
         
         tempMod1 = human.getModifier(mod1)
         tempMod2 = human.getModifier(mod2)
