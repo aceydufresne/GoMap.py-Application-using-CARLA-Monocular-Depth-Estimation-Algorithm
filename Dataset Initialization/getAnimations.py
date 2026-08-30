@@ -86,10 +86,86 @@ def findAnimations(context):
         wait_until="domcontentloaded",
         timeout=60_000
     )
-    
+
     page.get_by_role("link", name="Animations").click()
 
-    page.bring_to_front()
+    page.locator(".product.product-animation").first.wait_for(
+        state="visible"
+    )
+
+    animations = page.locator(".product.product-animation")
+    animation_count = animations.count()
+
+    print("Animations found:", animation_count)
+
+    for i in range(animation_count):
+
+        animations = page.locator(".product.product-animation")
+
+        animation = animations.nth(i)
+
+        title = animation.locator(
+            ".product-info p.text-capitalize"
+        ).inner_text().strip()
+
+        print(f"{i + 1}/{animation_count}: {title}")
+
+        animation.click()
+
+        download_button = page.get_by_role(
+            "button",
+            name="Download"
+        )
+
+        download_button.wait_for(
+            state="visible"
+        )
+
+        download_button.click()
+
+        page.get_by_text("Format").wait_for(
+            state="visible"
+        )
+
+        with page.expect_download() as download_info:
+
+            page.get_by_role(
+                "button",
+                name="Download"
+            ).last.click()
+
+        download = download_info.value
+
+        memTitle = (
+            title
+            .replace("/", "-")
+            .replace("\\", "-")
+            .replace(":", "-")
+            .replace("*", "-")
+            .replace("?", "-")
+            .replace('"', "-")
+            .replace("<", "-")
+            .replace(">", "-")
+            .replace("|", "-")
+        )
+
+        download.save_as(
+            DOWNLOAD_FOLDER / f"{memTitle}.fbx"
+        )
+
+        print("Saved:", memTitle)
+
+        page.get_by_role(
+            "link",
+            name="Animations"
+        ).click()
+
+        page.locator(
+            ".product.product-animation"
+        ).first.wait_for(
+            state="visible"
+        )
+
     page.pause()
 
 
