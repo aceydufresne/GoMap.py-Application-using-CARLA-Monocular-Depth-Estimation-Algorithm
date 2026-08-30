@@ -149,11 +149,11 @@ def findAnimations(context):
             .replace("|", "-")
         )
 
-        download.save_as(
-            DOWNLOAD_FOLDER / f"{memTitle}.fbx"
-        )
+        file_path = exportName(DOWNLOAD_FOLDER,memTitle,".fbx")
+        download.save_as(file_path)
 
-        print("Saved:", memTitle)
+        print("Saved:", file_path.name)
+
 
         page.get_by_role(
             "link",
@@ -167,6 +167,26 @@ def findAnimations(context):
         )
 
     page.pause()
+
+
+def exportName(folder, title, extension=".fbx"):
+
+    file_path = folder / f"{title}{extension}"
+
+    if not file_path.exists():
+        return file_path
+
+    counter = 1
+
+    while True:
+
+        file_path = folder / f"{title} ({counter}){extension}"
+
+        if not file_path.exists():
+            return file_path
+
+        counter += 1
+
 
 
 if __name__ == "__main__":
