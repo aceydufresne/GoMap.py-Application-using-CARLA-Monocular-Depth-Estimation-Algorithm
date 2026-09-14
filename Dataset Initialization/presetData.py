@@ -21,9 +21,7 @@ def sketchFabSelector(descriptions):
         #we have not run the script before/first test
         previous = pd.DataFrame()
         #a uniform sample with no partitions
-        sample = sketchFab.sample(n=min(target, len(sketchFab)), random_state = 42)
-        sample.to_csv( r"F:\CARLA set\meta_data\sketchfab_selected.csv",index=False)
-        oxl.download_objects(objects = sample, download_dir=r"F:\CARLA set\Sketchfab")    
+    sample = sketchFab.sample(n=min(target, len(sketchFab)), random_state = 42)   
     
     if not previous.empty:
         #if something is already populated in the folder, we add to it instead of creating new hash data
@@ -35,7 +33,7 @@ def sketchFabSelector(descriptions):
         #sanity check, remove all the matching cases of byte data
     allSelected = allSelected.drop_duplicates(subset = "sha256")
     allSelected.to_csv(csvPath, index = False)
-    oxl.donwload_objects(objects=sample, download_dir=downloadPath)
+    oxl.download_objects(objects=sample, download_dir=downloadPath)
     
 
 
