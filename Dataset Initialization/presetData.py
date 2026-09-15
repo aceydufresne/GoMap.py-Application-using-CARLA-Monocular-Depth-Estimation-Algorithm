@@ -1,7 +1,7 @@
 import objaverse.xl as oxl
 import pandas as pd
 import os
-
+import json
 
 def sketchFabSelector(descriptions):
     #limiting only to the set which has no description values
@@ -9,7 +9,7 @@ def sketchFabSelector(descriptions):
     csvPath = r"F:\CARLA set\meta_data\sketchfab_selected.csv"
     downloadPath = r"F:\CARLA set\Sketchfab"
     #keep track of what is in the folder already
-    target = 1000
+    target = 10
     
     if os.path.exists(csvPath):
         #if we have already run the script before.
@@ -37,9 +37,25 @@ def sketchFabSelector(descriptions):
     
 
 
+def smithsonianSelector(descriptions):
+    #very simple for this set, with only 2000 elements it is too small to partition
+    csvPath = r"F:\CARLA set\meta_data\smithsonian_selected.csv"
+    #sanity guard
+    if os.path.exists(csvPath):
+        return
+    
+    smithsonianSet = descriptions[descriptions["source"] == "smithsonian"].copy()
+    path = r"F:\CARLA set\Smithsonian"
+    oxl.download_objects(objects=smithsonianSet, download_dir=path)
+    
+    
+    
 if __name__ == "__main__":
     directory = r"F:\CARLA set\meta_data"
 #this is a file containing the descriptions and notes for categories of models
     descriptions = oxl.get_annotations(download_dir= directory)
     sources = descriptions["source"].unique()
-    sketchFabSelector(descriptions)
+    #sketchFabSelector(descriptions)
+    #do not run smithsonian set more than once
+    smithsonianSelector(descriptions)
+    print(descriptions["source"].value_counts())
