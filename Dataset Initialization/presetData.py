@@ -2,6 +2,10 @@ import objaverse.xl as oxl
 import pandas as pd
 import os
 import json
+import time
+import shutil
+import requests
+import hashlib
 
 def sketchFabSelector(descriptions):
     #limiting only to the set which has no description values
@@ -48,7 +52,48 @@ def smithsonianSelector(descriptions):
     path = r"F:\CARLA set\Smithsonian"
     oxl.download_objects(objects=smithsonianSet, download_dir=path)
     
+
+def githubSelector(descriptions):
+    path = r"F:\CARLA set\meta_data\github_selected.csv"
+    downloadPath = r"F:\CARLA set\github\github"
+    df = pd.read_csv(path)
+    #print(df.head())
+    #iterate through document:
+    target = 10
+    sample = df.sample(n=min(target,len(df)), random_state = 42)
     
+    for row in sample[["fileIdentifier", "fileType", "sha256"]].itertuples(index = False):
+        url = row.fileIdentifier
+        fileType = row.fileType
+        sha256 = row.sha256
+        #convert to scrape the actual files, that git viewer
+        rawURL = url.replace("https://github.com/", "https://raw.githubusercontent.com/").replace("/blob/", "/")
+        #print(rawURL)
+        
+        #check if this is already in the set
+        fileName = f"{sha256}.{fileType}"
+        filePath = os.path.join(path, fileName)
+        if os.path.exists(filePath):
+            continue
+        
+        try:
+            response = requests.get(rawURL, timeout= 60)
+            response.raise_for_status()
+            fileContents = response.content
+            actualHash = hashlib.sha256(fileContents).hexdigest()
+            
+            if actualHash != sha256:
+                print("Errir")
+                continue
+            
+            filePath = os.path.join(downloadPath, fileName)
+            with open(filePath, "wb") as file:
+                file.write(fileContents)
+        except requests.RequestException as e:
+            print(rawURL)
+            print(e)
+            
+            
     
 if __name__ == "__main__":
     directory = r"F:\CARLA set\meta_data"
@@ -57,5 +102,10 @@ if __name__ == "__main__":
     sources = descriptions["source"].unique()
     #sketchFabSelector(descriptions)
     #do not run smithsonian set more than once
-    smithsonianSelector(descriptions)
-    print(descriptions["source"].value_counts())
+    #smithsonianSelector(descriptions)
+    #print(descriptions["source"].value_counts())
+    path = r"F:\CARLA set\Smithsonian"
+    githubSelector(descriptions)
+    #print("Exists:", os.path.exists(path))
+    #print("Contents:", os.listdir(path))
+    
