@@ -1,0 +1,7 @@
+& "C:\Program Files\Blender Foundation\Blender 3.3\blender.exe" `
+    --background `
+    --python "F:\CARLA set\initialization\blender_script.py" `
+    -- `
+    --object_path "F:\CARLA set\Smithsonian\smithsonian\objects\0a4941fc-a9f9-548b-b7d8-9c8e0d5198bf.glb" `
+    --output_dir "F:\CARLA set\renders\test" `
+    --num_renders 12
