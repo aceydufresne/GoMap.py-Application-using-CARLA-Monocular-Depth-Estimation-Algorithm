@@ -1,31 +1,60 @@
-import os
+import struct
+import json
+import sys
+import bpy
+from pathlib import Path
 import subprocess
-import hashlib
+import os
 
-def navigator():
-    #main directory
-    rootdir = 'F:\CARLA set\sets'
-    blenderPath = (r"C:\Program Files\Blender Foundation\Blender 3.3\blender.exe")
-    blenderScript = (r"F:\CARLA set\rendering\blender_script.py")
-    outputPath = (r"F:\CARLA set\renders\test")
+blender_path = r"C:\Program Files\Blender Foundation\Blender 3.3\blender.exe"
+decoder_script = r"F:\CARLA set\rendering\mesh_decoder.py"
+coordinates = r"F:\CARLA set\sets\coordinates"
+
+def openJson(path):
+    text = " "
+    with open(path, "rb") as file:
+        magic = file.read(4)
+        version = struct.unpack("<I", file.read(4))[0]
+        totalLength = struct.unpack("<I", file.read(4))[0]
+        
+        if magic != b"glTF":
+            #if this isn't the header
+            raise ValueError("Error sorting")
+        else:
+            jsonLength = struct.unpack("<I", file.read(4))[0]
+            jsonType = file.read(4)
+            #how long are the isntructions
+            jsonBytes = file.read(jsonLength)
+            #encoder informationL
+            jsonText = jsonBytes.decode("utf-8").rstrip("\x00")
+            gltf = json.loads(jsonText)
+            text = jsonText
+    return text
+
+def import_model(path):
+    ext = path.suffix
+    vertices = subprocess.run([
+        blender_path,
+        "--background",
+        "--python",
+        decoder_script,
+        "--",
+        "-mp",
+        path], check = True)
+    export(path, vertices)
+
+def export(mesh_path):
+    mesh_name = os.path.splitext(os.path.basename(mesh_path))[0]
+    output_path = os.path.join(coordinates,mesh_name + ".npz")
     
-    #you can also do this with os walk
-    subroutes = ['F:\CARLA set\sets\Sketchfab\hf-objaverse-v1\glbs', 'F:\CARLA set\sets\Smithsonian\smithsonian\objects', 'F:\CARLA set\sets\github\github']
-    #for sub in subroutes:
-        #for files in sub:
-         #   continue
-         
-    for file in os.listdir('F:\CARLA set\sets\github\github'):
-        filePath = os.path.join('F:\CARLA set\sets\github\github', file)
-        fileName = hashlib.sha256()
-        
-        with open(filePath, "rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                fileName.update(chunk)
-        id = fileName.hexdigest()
-        renderPath = os.path.join(outputPath, id)
-        os.makedirs(renderPath, exist_ok= True)
-        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", filePath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
-        
+    
+    return output_path
+    
+
+
+
+
 if __name__ == "__main__":
-    navigator()
+    path = r"F:\CARLA set\sets\Smithsonian\smithsonian\objects\0c671175-1a78-5620-aff7-5d7d3c6af643.glb"
+    #text = openJson(path)
+    import_model(path)
