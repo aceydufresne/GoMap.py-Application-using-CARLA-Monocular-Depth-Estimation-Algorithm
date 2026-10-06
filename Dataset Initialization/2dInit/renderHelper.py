@@ -11,6 +11,21 @@ def navigator():
     blenderPath = (r"C:\Program Files\Blender Foundation\Blender 3.3\blender.exe")
     blenderScript = (r"F:\CARLA set\rendering\blender_script.py")
     outputPath = (r"F:\CARLA set\renders\test")
+    #stored in independent files
+    gitSet = r'F:\CARLA set\sets\github\github'
+    #collections in subfolders
+    sketchSet = r'F:\CARLA set\sets\Sketchfab\hf-objaverse-v1\glbs'
+    #stored in independent files
+    smithSet = r'F:\CARLA set\sets\Smithsonian\smithsonian\objects'
+    #empty right now
+    thingSet = r'F:\CARLA set\sets\Thingiverse\thingiverse'
+    gitArray = []
+    sketchArray = []
+    smithArray = []
+    gitRender = r'F:\CARLA set\renders\github'
+    sketchRender = r'F:\CARLA set\renders\sketchfab'
+    smithRender = r'F:\CARLA set\renders\smithsonian'
+    
     
     #you can also do this with os walk
     subroutes = ['F:\CARLA set\sets\Sketchfab\hf-objaverse-v1\glbs', 'F:\CARLA set\sets\Smithsonian\smithsonian\objects', 'F:\CARLA set\sets\github\github']
@@ -18,17 +33,55 @@ def navigator():
         #for files in sub:
          #   continue
          
-    for file in os.listdir('F:\CARLA set\sets\github\github'):
-        filePath = os.path.join('F:\CARLA set\sets\github\github', file)
-        fileName = hashlib.sha256()
+    #for file in os.listdir('F:\CARLA set\sets\github\github'):
+        #filePath = os.path.join('F:\CARLA set\sets\github\github', file)
+        #fileName = hashlib.sha256()
         
-        with open(filePath, "rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                fileName.update(chunk)
-        id = fileName.hexdigest()
-        renderPath = os.path.join(outputPath, id)
-        os.makedirs(renderPath, exist_ok= True)
-        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", filePath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
+        #with open(filePath, "rb") as file:
+            #for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                #fileName.update(chunk)
+        #id = fileName.hexdigest()
+        #renderPath = os.path.join(outputPath, id)
+        #os.makedirs(renderPath, exist_ok= True)
+    for file in os.listdir(gitSet):
+        #print(file)
+        fullPath = os.path.join(gitSet, file)
+        id = os.path.splitext(file)[0]
+        renderPath = os.path.join(gitRender, id)
+        gitArray.append((fullPath, renderPath))        
+    
+    for subdir, dirs, files in os.walk(sketchSet):
+            for file in files:
+                id = os.path.splitext(file)[0]
+                fullPath = os.path.join(subdir, file)
+                renderPath = os.path.join(sketchRender, id)
+                sketchArray.append((fullPath, renderPath))
+    for file in os.listdir(smithSet):
+        #print(file)
+        id = os.path.splitext(file)[0]
+        fullPath = os.path.join(smithSet, file)
+        renderPath = os.path.join(smithRender, id)
+        smithArray.append((fullPath, renderPath))
+        
+#running/saving images into directory
+    for mesh in gitArray:
+        renderPath = mesh[1]
+        fullPath = mesh[0]
+        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", fullPath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
+        #hash from initial encoding script
+        id = os.path.splitext(os.path.basename(mesh[0]))[0]
+    for mesh in sketchArray:
+        renderPath = mesh[1]
+        fullPath = mesh[0]
+        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", fullPath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
+    for mesh in smithArray:
+        renderPath = mesh[1]
+        fullPath = mesh[0]
+        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", fullPath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
+        
+    
+    
+    
         
         #iterate through directories and pass file names
 def feedFile():
@@ -125,6 +178,6 @@ def feedFile():
         
         
 if __name__ == "__main__":
-    #navigator()
+    navigator()
     #decoder_script = r"F:\CARLA set\initialization\coordinateInit.blend"
-    feedFile()
+    #feedFile()
