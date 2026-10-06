@@ -2,6 +2,7 @@ import bpy
 import sys
 import os
 import argparse
+import json
 
 
 def get_arguments():
@@ -30,6 +31,9 @@ def import_mesh(path):
 
     elif extension == ".obj":
         bpy.ops.import_scene.obj(filepath=path)
+    
+    elif extension == ".stl":
+        bpy.ops.import_mesh.stl(filepath=path)
 
     else:
         raise ValueError(f"Unsupported file type: {extension}")
@@ -67,5 +71,5 @@ def find_data(path):
 if __name__ == "__main__":
 
     args = get_arguments()
-
-    find_data(args.model_path)
+    vertices = find_data(args.model_path)
+    print("VERTEX_DATA:" + json.dumps(vertices))
