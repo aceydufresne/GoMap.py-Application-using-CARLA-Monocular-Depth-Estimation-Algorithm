@@ -2,6 +2,8 @@ import os
 import subprocess
 import hashlib
 from pathlib import Path
+import numpy as np
+import json
 
 def navigator():
     #main directory
@@ -30,6 +32,9 @@ def navigator():
         
         #iterate through directories and pass file names
 def feedFile():
+    coordinate_path = r"F:\CARLA set\sets\coordinates\github"
+    blender_path = r"C:\Program Files\Blender Foundation\Blender 3.3\blender.exe"
+    decoder_script = r"F:\CARLA set\initialization\coordinateInit.py"
     #stored in independent files
     gitSet = r'F:\CARLA set\sets\github\github'
     #collections in subfolders
@@ -57,13 +62,39 @@ def feedFile():
         #working 10/05
     for file in os.listdir(smithSet):
         #print(file)
-        fullPath = os.path.join(gitSet, file)
+        fullPath = os.path.join(smithSet, file)
         smithArray.append(fullPath)
+        
+        
+    #create a text file to store coordinate adata
     #pass each array to the blender_script
     for mesh in gitArray:
         
-    
+        result = subprocess.run([blender_path, "--background", "--python", decoder_script, "--", "--model_path", mesh], capture_output=True, text=True, encoding="utf-8", errors = "replace", check=True)
+        vertices = None
+        for line in result.stdout.splitlines():
+            #segregates the normal blender output from json data
+            if line.startswith("VERTEX_DATA:"):
+                vertices = json.loads(line[len("VERTEX_DATA:"):])
+                break
+        if vertices is None:
+            print("\nERROR IN MESH:", mesh)
+            print("----- BLENDER STDOUT -----")
+            print(result.stdout)
+            print("----- BLENDER STDERR -----")
+            print(result.stderr)
+            continue
+        vertices = np.array(vertices)
+        #hash from initial encoding script
+        id = os.path.splitext(os.path.basename(mesh))[0]
+        coordinateFile = os.path.join(coordinate_path,id+".npy")
+        np.save(coordinateFile,vertices)
+        
+        
+                
+        
         
 if __name__ == "__main__":
     #navigator()
+    #decoder_script = r"F:\CARLA set\initialization\coordinateInit.blend"
     feedFile()
