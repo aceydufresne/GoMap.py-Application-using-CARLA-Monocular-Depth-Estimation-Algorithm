@@ -32,7 +32,9 @@ def navigator():
         
         #iterate through directories and pass file names
 def feedFile():
-    coordinate_path = r"F:\CARLA set\sets\coordinates\github"
+    coordinate_git = r"F:\CARLA set\sets\coordinates\github"
+    coordinate_sketch = r"F:\CARLA set\sets\coordinates\sketchfab"
+    coordinate_smith = r"F:\CARLA set\sets\coordinates\smithsonian"
     blender_path = r"C:\Program Files\Blender Foundation\Blender 3.3\blender.exe"
     decoder_script = r"F:\CARLA set\initialization\coordinateInit.py"
     #stored in independent files
@@ -78,20 +80,48 @@ def feedFile():
                 vertices = json.loads(line[len("VERTEX_DATA:"):])
                 break
         if vertices is None:
-            print("\nERROR IN MESH:", mesh)
-            print("----- BLENDER STDOUT -----")
-            print(result.stdout)
-            print("----- BLENDER STDERR -----")
-            print(result.stderr)
+            print("error handling files")
             continue
         vertices = np.array(vertices)
         #hash from initial encoding script
         id = os.path.splitext(os.path.basename(mesh))[0]
-        coordinateFile = os.path.join(coordinate_path,id+".npy")
+        coordinateFile = os.path.join(coordinate_git,id+".npy")
+        np.save(coordinateFile,vertices)
+    
+    for mesh in smithArray:
+        
+        result = subprocess.run([blender_path, "--background", "--python", decoder_script, "--", "--model_path", mesh], capture_output=True, text=True, encoding="utf-8", errors = "replace", check=True)
+        vertices = None
+        for line in result.stdout.splitlines():
+            #segregates the normal blender output from json data
+            if line.startswith("VERTEX_DATA:"):
+                vertices = json.loads(line[len("VERTEX_DATA:"):])
+                break
+        if vertices is None:
+            print("error handling files")
+            continue
+        vertices = np.array(vertices)
+        #hash from initial encoding script
+        id = os.path.splitext(os.path.basename(mesh))[0]
+        coordinateFile = os.path.join(coordinate_smith,id+".npy")
         np.save(coordinateFile,vertices)
         
-        
-                
+    for mesh in sketchArray:
+        result = subprocess.run([blender_path, "--background", "--python", decoder_script, "--", "--model_path", mesh], capture_output=True, text=True, encoding="utf-8", errors = "replace", check=True)
+        vertices = None
+        for line in result.stdout.splitlines():
+            #segregates the normal blender output from json data
+            if line.startswith("VERTEX_DATA:"):
+                vertices = json.loads(line[len("VERTEX_DATA:"):])
+                break
+        if vertices is None:
+            print("error handling files")
+            continue
+        vertices = np.array(vertices)
+        #hash from initial encoding script
+        id = os.path.splitext(os.path.basename(mesh))[0]
+        coordinateFile = os.path.join(coordinate_sketch,id+".npy")
+        np.save(coordinateFile,vertices)
         
         
 if __name__ == "__main__":
