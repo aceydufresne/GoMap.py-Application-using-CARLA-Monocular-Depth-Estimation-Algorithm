@@ -11,20 +11,27 @@ struct Edges{
     int y;
     int strength;
 };
-int contour_detection(std::string& path){
 
+struct EdgeData {
+    int height = 0;
+    int width = 0;
+    std::vector<std::pair<double, double>> pixel_dist;
+};
+
+int contour_detection(std::string& path){
+    return 1;
 }
 
 
 //sobel edge detection over canny, because all the images are generated and already have clean noise free edges
 //'&' use reference rather than creating a copy of the memory location
-int edge_encoder(std::string& path)
+EdgeData edge_encoder(std::string& path)
 {
    //'cv' means use the function from the dependency
     cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
     if (img.empty()){
         std::cout<<"Found the error!"<<std::endl;
-        return -1;
+        return {};
     }
     //specialized array for images, different to how we did in c
     cv::Mat sobelx, sobely, gradient;
@@ -49,6 +56,11 @@ int edge_encoder(std::string& path)
 
     int height = gradient_abs.rows;
     int width = gradient_abs.cols;
+    //set those values for the struct
+    EdgeData edgeData;
+    edgeData.height = height;
+    edgeData.width = width;
+
     std::cout<<"Height:"<<height<<"\n";
     std::cout<<"Width:"<<width<<"\n";
 
@@ -74,11 +86,80 @@ int edge_encoder(std::string& path)
                 //double manhattan_tot = manhattan_x + manhattan_y;
                 std::pair<double, double> temp_dist = {manhattan_x, manhattan_y};
                 //matrix of all distance of edge pixels
-                pixel_dist.push_back(temp_dist);
+                edgeData.pixel_dist.push_back(temp_dist);
             }
         }
     }
-    return 0;
+    return edgeData;
+}
+
+void draw_edges(const EdgeData& data)
+{
+    cv::Mat edge_frame = cv::Mat::zeros(
+        data.height,
+        data.width,
+        CV_8UC1
+    );
+
+    double center_x = (data.width - 1) / 2.0;
+    double center_y = (data.height - 1) / 2.0;
+
+    for (const auto& [dx, dy] : data.pixel_dist) {
+        int x = static_cast<int>(std::round(center_x - dx));
+        int y = static_cast<int>(std::round(center_y - dy));
+
+        if (x >= 0 && x < data.width &&
+            y >= 0 && y < data.height) {
+            edge_frame.at<uchar>(y, x) = 255;
+        }
+    }
+
+    cv::imshow("Reconstructed Edges", edge_frame);
+    cv::waitKey(0);
+}
+
+EdgeData normalize(const EdgeData& data)
+{
+    EdgeData normalizedData;
+
+    normalizedData.width = data.width;
+    normalizedData.height = data.height;
+
+    double centerX = data.width / 2.0;
+    double centerY = data.height / 2.0;
+
+    for (const auto& [dx, dy] : data.pixel_dist) {
+
+        double normalizedX = dx / centerX;
+        double normalizedY = dy / centerY;
+
+        normalizedData.pixel_dist.emplace_back(
+            normalizedX,
+            normalizedY
+        );
+    }
+
+    return normalizedData;
+}
+
+int find_matches(const EdgeData& data, const EdgeData& input){
+//sliding window
+int input_height = input.height;
+int input_width = input.width;
+int window_height = input_height;
+int window_width =input_width;
+int stride_x = std::max(1, windowWidth/10);
+int stide_y = std::max(1, window_height/10);
+bool match = false;
+double bestMatch = 0.0;
+
+while(match != true){
+    for(int i = 0; i<= input_height; i+=stride_y){
+        for(int j = 0; j<= input_width; j+= stride_x){
+
+        }
+    }
+}
 }
 
 int main()
@@ -86,5 +167,15 @@ int main()
     //raw string, no escape keys
     std::cout << "Program started!" << std::endl;
     std::string testPath = R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
-    edge_encoder(testPath);
+    std::string testInput = R"(C:\Users\Acey\Downloads\box.jpg)";
+    EdgeData edges = edge_encoder(testPath);
+    EdgeData inputTest = edge_encoder(testInput);
+
+    if (edges.width > 0 && edges.height > 0) {
+        draw_edges(edges);
+    }
+
+    test_edges = normalize(edges);
+    test_inputTest = normalize(edges);
+
 }
