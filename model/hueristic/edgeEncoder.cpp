@@ -2,6 +2,8 @@
 #include<iostream>
 #include <string>
 #include <vector>
+#include <tuple>
+#include <utility>
 
 
 struct Edges{
@@ -9,6 +11,10 @@ struct Edges{
     int y;
     int strength;
 };
+int contour_detection(std::string& path){
+
+}
+
 
 //sobel edge detection over canny, because all the images are generated and already have clean noise free edges
 //'&' use reference rather than creating a copy of the memory location
@@ -18,6 +24,7 @@ int edge_encoder(std::string& path)
     cv::Mat img = cv::imread(path, cv::IMREAD_GRAYSCALE);
     if (img.empty()){
         std::cout<<"Found the error!"<<std::endl;
+        return -1;
     }
     //specialized array for images, different to how we did in c
     cv::Mat sobelx, sobely, gradient;
@@ -41,10 +48,36 @@ int edge_encoder(std::string& path)
     //std::cout << gradient_abs << std::endl;
 
     int height = gradient_abs.rows;
-    int width = gradient_abs.rows;
+    int width = gradient_abs.cols;
     std::cout<<"Height:"<<height<<"\n";
     std::cout<<"Width:"<<width<<"\n";
 
+    //find center
+    double center_x = (width-1) / 2.0;
+    double center_y = (height-1) / 2.0;
+    int threshold = 50;
+    //find distance between edge pixels and center point
+    std::vector<cv::Point> edge_pixels = {};
+    std::vector<std::pair<double, double>> pixel_dist;
+    for(int i = 0; i<height; i++){
+        for(int j = 0; j < width; j++){
+            
+            //gradient change in a pixel
+            uchar gradVal = gradient_abs.at<uchar>(i, j);
+            if (gradVal >= threshold){
+                edge_pixels.push_back(cv::Point(j,i));
+                //use manhanttan distance, so we can rebuild the structure
+                double temp_x = j;
+                double temp_y = i;
+                double manhattan_x = center_x - temp_x;
+                double manhattan_y = center_y - temp_y;
+                //double manhattan_tot = manhattan_x + manhattan_y;
+                std::pair<double, double> temp_dist = {manhattan_x, manhattan_y};
+                //matrix of all distance of edge pixels
+                pixel_dist.push_back(temp_dist);
+            }
+        }
+    }
     return 0;
 }
 
