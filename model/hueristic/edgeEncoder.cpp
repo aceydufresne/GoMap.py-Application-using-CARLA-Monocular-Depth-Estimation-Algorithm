@@ -4,19 +4,34 @@
 #include <vector>
 #include <tuple>
 #include <utility>
+#include <unordered_map>
+#include <algorithm>
+#include <cstdint>
 
 //group of pixels that share a connection
 struct EdgeLine {
     int id;
+    int componentID;
 
     std::vector<cv::Point> pixels;
 
-    cv::Point start;
-    cv::Point end;
+    bool closed = false;
+
+    // Eventually store fitted function here
+};
+
+//create a directional component for lines
+// An individual ordered path
+struct TracedLine {
+    int id;
+    int componentID;
+
+    std::vector<cv::Point> pixels;
 
     bool closed = false;
 };
 
+//class types for specific pixels in a line
 enum class PointType {
     ENDPOINT,
     INTERMEDIATE,
@@ -24,9 +39,29 @@ enum class PointType {
     ISOLATED
 };
 
-struct EdgeGraph {
-    std::vector<EdgeLine> lines;
+struct EdgePoint {
+    int x;
+    int y;
+
+    std::vector<cv::Point> neighbors;
+    PointType type = PointType::ISOLATED;
 };
+
+// A group of connected edge pixels
+struct EdgeComponent {
+    int id;
+
+    std::vector<EdgePoint> points;
+    std::vector<cv::Point> endpoints;
+    std::vector<cv::Point> junctions;
+};
+
+struct EdgeGraph {
+    std::vector<EdgeComponent> components;
+    std::vector<TracedLine> tracedLines;
+};
+
+using EdgeKey = std::pair<uint64_t, uint64_t>;
 
 struct Edges{
     int x;
@@ -40,16 +75,18 @@ struct EdgeData {
     std::vector<std::pair<double, double>> pixel_dist;
 };
 
-struct EdgePoint {
-    int x;
-    int y;
 
-    std::vector<cv::Point> neighbors;
+
+struct PixelPairHash {
+    size_t operator()(
+        const std::pair<uint64_t, uint64_t>& edge
+    ) const {
+        size_t h1 = std::hash<uint64_t>{}(edge.first);
+        size_t h2 = std::hash<uint64_t>{}(edge.second);
+
+        return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    }
 };
-
-int contour_detection(std::string& path){
-    return 1;
-}
 
 
 //sobel edge detection over canny, because all the images are generated and already have clean noise free edges
@@ -293,6 +330,167 @@ EdgeGraph draw_line(const cv::Mat& edges) {
 
             // Save the completed connected group
             graph.lines.push_back(line);
+        }
+    }
+
+    return graph;
+}
+
+EdgeGraph trace_line(EdgeGraph graph) {
+
+    int tracedID = 0;
+
+    // Iterate through each connected component
+    for (const EdgeLine& component : graph.lines) {
+
+        // Map pixel coordinates to their EdgePoint structures
+        std::unordered_map<uint64_t, const EdgePoint*> lookup;
+
+        auto pixelKey = [](const cv::Point& p) -> uint64_t {
+            return (uint64_t(uint32_t(p.y)) << 32) |
+                    uint32_t(p.x);
+        };
+
+        auto connectionKey = [&](const cv::Point& a,
+                                 const cv::Point& b) -> EdgeKey {
+
+            uint64_t keyA = pixelKey(a);
+            uint64_t keyB = pixelKey(b);
+
+            return std::minmax(keyA, keyB);
+        };
+
+        for (const EdgePoint& point : component.points) {
+            lookup[pixelKey(cv::Point(point.x, point.y))] = &point;
+        }
+
+        // Track connections already traced in this component
+        std::unordered_set<EdgeKey, PixelPairHash> visitedEdges;
+
+        // Trace a path beginning with one particular connection
+        auto traceFrom = [&](const cv::Point& start,
+                             const cv::Point& firstNeighbor) {
+
+            TracedLine traced;
+            traced.id = tracedID++;
+            traced.componentID = component.id;
+            traced.closed = false;
+
+            traced.pixels.push_back(start);
+
+            cv::Point previous = start;
+            cv::Point current = firstNeighbor;
+
+            visitedEdges.insert(connectionKey(previous, current));
+
+            while (true) {
+
+                traced.pixels.push_back(current);
+
+                // Returning to the starting pixel means
+                // this traced path is closed
+                if (current == start) {
+                    traced.closed = true;
+                    break;
+                }
+
+                auto it = lookup.find(pixelKey(current));
+
+                if (it == lookup.end()) {
+                    break;
+                }
+
+                const EdgePoint* currentPoint = it->second;
+
+                // Stop at an endpoint or junction
+                if (currentPoint->type == PointType::ENDPOINT ||
+                    currentPoint->type == PointType::JUNCTION) {
+                    break;
+                }
+
+                bool foundNext = false;
+                cv::Point next;
+
+                for (const cv::Point& neighbor :
+                     currentPoint->neighbors) {
+
+                    if (neighbor == previous) {
+                        continue;
+                    }
+
+                    EdgeKey key = connectionKey(current, neighbor);
+
+                    if (visitedEdges.count(key) != 0) {
+                        continue;
+                    }
+
+                    next = neighbor;
+                    visitedEdges.insert(key);
+                    foundNext = true;
+                    break;
+                }
+
+                if (!foundNext) {
+                    break;
+                }
+
+                previous = current;
+                current = next;
+            }
+
+            graph.tracedLines.push_back(std::move(traced));
+        };
+
+        // STEP 1: Start at endpoints and junctions
+        for (const EdgePoint& point : component.points) {
+
+            if (point.type != PointType::ENDPOINT &&
+                point.type != PointType::JUNCTION) {
+                continue;
+            }
+
+            cv::Point start(point.x, point.y);
+
+            for (const cv::Point& neighbor : point.neighbors) {
+
+                EdgeKey key = connectionKey(start, neighbor);
+
+                if (visitedEdges.count(key) == 0) {
+                    traceFrom(start, neighbor);
+                }
+            }
+        }
+
+        // STEP 2: Trace remaining connections
+        // This catches closed loops without endpoints
+        for (const EdgePoint& point : component.points) {
+
+            cv::Point start(point.x, point.y);
+
+            for (const cv::Point& neighbor : point.neighbors) {
+
+                EdgeKey key = connectionKey(start, neighbor);
+
+                if (visitedEdges.count(key) == 0) {
+                    traceFrom(start, neighbor);
+                }
+            }
+        }
+
+        // STEP 3: Handle isolated pixels
+        for (const EdgePoint& point : component.points) {
+
+            if (point.type == PointType::ISOLATED) {
+
+                TracedLine traced;
+                traced.id = tracedID++;
+                traced.componentID = component.id;
+                traced.closed = false;
+
+                traced.pixels.push_back(cv::Point(point.x, point.y));
+
+                graph.tracedLines.push_back(std::move(traced));
+            }
         }
     }
 
