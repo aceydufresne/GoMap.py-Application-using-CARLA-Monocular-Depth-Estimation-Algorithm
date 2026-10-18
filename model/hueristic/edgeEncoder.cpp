@@ -7,6 +7,9 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cstdint>
+#include <queue>
+#include <unordered_set>
+#include <cmath>
 
 //group of pixels that share a connection
 struct EdgeLine {
@@ -214,8 +217,8 @@ int input_height = input.height;
 int input_width = input.width;
 int window_height = input_height;
 int window_width =input_width;
-int stride_x = std::max(1, windowWidth/10);
-int stide_y = std::max(1, window_height/10);
+int stride_x = std::max(1, window_width / 10);
+int stride_y = std::max(1, window_height / 10);
 bool match = false;
 double bestMatch = 0.0;
 
@@ -228,7 +231,7 @@ while(match != true){
 }
 }
 
-EdgeGraph draw_line(const cv::Mat& edges) {
+EdgeGraph draw_component(const cv::Mat& edges) {
 
     EdgeGraph graph;
 
@@ -249,7 +252,7 @@ EdgeGraph draw_line(const cv::Mat& edges) {
                 continue;
             }
 
-            EdgeLine line;
+            EdgeComponent line;
             line.id = lineID++;
 
             std::queue<cv::Point> queue;
@@ -329,7 +332,7 @@ EdgeGraph draw_line(const cv::Mat& edges) {
             }
 
             // Save the completed connected group
-            graph.lines.push_back(line);
+            graph.components.push_back(std::move(line));
         }
     }
 
@@ -341,7 +344,7 @@ EdgeGraph trace_line(EdgeGraph graph) {
     int tracedID = 0;
 
     // Iterate through each connected component
-    for (const EdgeLine& component : graph.lines) {
+    for (const EdgeComponent& component : graph.components) {
 
         // Map pixel coordinates to their EdgePoint structures
         std::unordered_map<uint64_t, const EdgePoint*> lookup;
@@ -497,21 +500,99 @@ EdgeGraph trace_line(EdgeGraph graph) {
     return graph;
 }
 
+cv::Mat create_edge_map(const EdgeData& data) {
 
-int main()
-{
-    //raw string, no escape keys
-    std::cout << "Program started!" << std::endl;
-    std::string testPath = R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
-    std::string testInput = R"(C:\Users\Acey\Downloads\box.jpg)";
-    EdgeData edges = edge_encoder(testPath);
-    EdgeData inputTest = edge_encoder(testInput);
+    cv::Mat edgeMap = cv::Mat::zeros(
+        data.height,
+        data.width,
+        CV_8UC1
+    );
 
-    if (edges.width > 0 && edges.height > 0) {
-        draw_edges(edges);
+    double centerX = data.width / 2.0;
+    double centerY = data.height / 2.0;
+
+    double originalCenterX = (data.width - 1) / 2.0;
+    double originalCenterY = (data.height - 1) / 2.0;
+
+    for (const auto& [dx, dy] : data.pixel_dist) {
+
+        // Reverse normalization
+        double originalDX = dx * centerX;
+        double originalDY = dy * centerY;
+
+        int x = static_cast<int>(
+            std::round(originalCenterX - originalDX)
+        );
+
+        int y = static_cast<int>(
+            std::round(originalCenterY - originalDY)
+        );
+
+        if (x >= 0 && x < data.width &&
+            y >= 0 && y < data.height) {
+
+            edgeMap.at<uchar>(y, x) = 255;
+        }
     }
 
-    test_edges = normalize(edges);
-    test_inputTest = normalize(edges);
+    return edgeMap;
+}
 
+int main() {
+
+    std::cout << "Program started!" << std::endl;
+
+    std::string testPath =
+        R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
+
+    // STEP 1: Detect edge pixels
+    EdgeData edges = edge_encoder(testPath);
+
+    if (edges.width == 0 || edges.height == 0) {
+        std::cerr << "Failed to load image." << std::endl;
+        return 1;
+    }
+
+    // STEP 2: Normalize edge coordinates
+    EdgeData test_edges = normalize(edges);
+
+    // STEP 3: Reconstruct binary edge map
+    cv::Mat edgeMap = create_edge_map(test_edges);
+
+    // STEP 4: Find connected components
+    EdgeGraph graph = draw_line(edgeMap);
+
+    // STEP 5: Trace individual paths
+    graph = trace_line(std::move(graph));
+
+    // STEP 6: Print results
+    std::cout << "Connected components: "
+              << graph.components.size() << std::endl;
+
+    std::cout << "Traced lines: "
+              << graph.tracedLines.size() << std::endl;
+
+    int closedLoops = 0;
+
+    for (const TracedLine& line : graph.tracedLines) {
+
+        if (line.closed) {
+            closedLoops++;
+        }
+
+        std::cout << "Line " << line.id
+                  << " | Component: " << line.componentID
+                  << " | Pixels: " << line.pixels.size()
+                  << " | Closed: " << (line.closed ? "Yes" : "No")
+                  << std::endl;
+    }
+
+    std::cout << "Closed loops: "
+              << closedLoops << std::endl;
+
+    // STEP 7: Display the binary edge map
+    cv::imshow("Edge Map", edgeMap);
+    cv::waitKey(0);
+
+    return 0;
 }
