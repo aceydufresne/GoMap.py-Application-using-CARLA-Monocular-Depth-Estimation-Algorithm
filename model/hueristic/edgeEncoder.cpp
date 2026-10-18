@@ -5,6 +5,28 @@
 #include <tuple>
 #include <utility>
 
+//group of pixels that share a connection
+struct EdgeLine {
+    int id;
+
+    std::vector<cv::Point> pixels;
+
+    cv::Point start;
+    cv::Point end;
+
+    bool closed = false;
+};
+
+enum class PointType {
+    ENDPOINT,
+    INTERMEDIATE,
+    JUNCTION,
+    ISOLATED
+};
+
+struct EdgeGraph {
+    std::vector<EdgeLine> lines;
+};
 
 struct Edges{
     int x;
@@ -16,6 +38,13 @@ struct EdgeData {
     int height = 0;
     int width = 0;
     std::vector<std::pair<double, double>> pixel_dist;
+};
+
+struct EdgePoint {
+    int x;
+    int y;
+
+    std::vector<cv::Point> neighbors;
 };
 
 int contour_detection(std::string& path){
@@ -161,6 +190,115 @@ while(match != true){
     }
 }
 }
+
+EdgeGraph draw_line(const cv::Mat& edges) {
+
+    EdgeGraph graph;
+
+    int height = edges.rows;
+    int width = edges.cols;
+
+    cv::Mat visited = cv::Mat::zeros(
+        height, width, CV_8UC1
+    );
+
+    int lineID = 0;
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+
+            if (edges.at<uchar>(y, x) == 0 ||
+                visited.at<uchar>(y, x) != 0) {
+                continue;
+            }
+
+            EdgeLine line;
+            line.id = lineID++;
+
+            std::queue<cv::Point> queue;
+            queue.push(cv::Point(x, y));
+
+            visited.at<uchar>(y, x) = 1;
+
+            while (!queue.empty()) {
+
+                cv::Point current = queue.front();
+                queue.pop();
+
+                EdgePoint point;
+                point.x = current.x;
+                point.y = current.y;
+
+                // Check all 8 neighboring pixels
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+
+                        int nx = current.x + dx;
+                        int ny = current.y + dy;
+
+                        if (nx < 0 || nx >= width ||
+                            ny < 0 || ny >= height) {
+                            continue;
+                        }
+
+                        if (edges.at<uchar>(ny, nx) != 0) {
+
+                            point.neighbors.push_back(
+                                cv::Point(nx, ny)
+                            );
+
+                            if (visited.at<uchar>(ny, nx) == 0) {
+
+                                visited.at<uchar>(ny, nx) = 1;
+
+                                queue.push(
+                                    cv::Point(nx, ny)
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Classify AFTER checking all neighbors
+                int connections = point.neighbors.size();
+
+                if (connections == 0) {
+                    point.type = PointType::ISOLATED;
+                }
+                else if (connections == 1) {
+                    point.type = PointType::ENDPOINT;
+
+                    line.endpoints.push_back(
+                        cv::Point(point.x, point.y)
+                    );
+                }
+                else if (connections == 2) {
+                    point.type = PointType::INTERMEDIATE;
+                }
+                else {
+                    point.type = PointType::JUNCTION;
+
+                    line.junctions.push_back(
+                        cv::Point(point.x, point.y)
+                    );
+                }
+
+                // Add each pixel exactly once
+                line.points.push_back(point);
+            }
+
+            // Save the completed connected group
+            graph.lines.push_back(line);
+        }
+    }
+
+    return graph;
+}
+
 
 int main()
 {
