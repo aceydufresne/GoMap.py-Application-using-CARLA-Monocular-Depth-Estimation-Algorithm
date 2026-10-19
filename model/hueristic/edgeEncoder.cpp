@@ -10,6 +10,21 @@
 #include <queue>
 #include <unordered_set>
 #include <cmath>
+#include <opencv2/ximgproc.hpp>
+
+//pixels with edge neighbors that are not lines
+struct RegionConnection {
+    cv::Point inside;
+    cv::Point outside;
+};
+
+struct PixelRegion {
+    int id;
+    int componentID;
+
+    std::vector<cv::Point> pixels;
+    std::vector<RegionConnection> connections;
+};
 
 //group of pixels that share a connection
 struct EdgeLine {
@@ -62,6 +77,8 @@ struct EdgeComponent {
 struct EdgeGraph {
     std::vector<EdgeComponent> components;
     std::vector<TracedLine> tracedLines;
+
+    std::vector<PixelRegion> regions;
 };
 
 using EdgeKey = std::pair<uint64_t, uint64_t>;
@@ -91,6 +108,9 @@ struct PixelPairHash {
     }
 };
 
+uint64_t pixelKey(int x, int y) {
+    return (uint64_t(uint32_t(y)) << 32) | uint32_t(x);
+}
 
 //sobel edge detection over canny, because all the images are generated and already have clean noise free edges
 //'&' use reference rather than creating a copy of the memory location
@@ -229,6 +249,7 @@ while(match != true){
         }
     }
 }
+return 1;
 }
 
 EdgeGraph draw_component(const cv::Mat& edges) {
@@ -269,7 +290,6 @@ EdgeGraph draw_component(const cv::Mat& edges) {
                 point.x = current.x;
                 point.y = current.y;
 
-                // Check all 8 neighboring pixels
                 for (int dy = -1; dy <= 1; dy++) {
                     for (int dx = -1; dx <= 1; dx++) {
 
@@ -303,7 +323,6 @@ EdgeGraph draw_component(const cv::Mat& edges) {
                     }
                 }
 
-                // Classify AFTER checking all neighbors
                 int connections = point.neighbors.size();
 
                 if (connections == 0) {
@@ -327,11 +346,9 @@ EdgeGraph draw_component(const cv::Mat& edges) {
                     );
                 }
 
-                // Add each pixel exactly once
                 line.points.push_back(point);
             }
 
-            // Save the completed connected group
             graph.components.push_back(std::move(line));
         }
     }
@@ -343,10 +360,8 @@ EdgeGraph trace_line(EdgeGraph graph) {
 
     int tracedID = 0;
 
-    // Iterate through each connected component
     for (const EdgeComponent& component : graph.components) {
 
-        // Map pixel coordinates to their EdgePoint structures
         std::unordered_map<uint64_t, const EdgePoint*> lookup;
 
         auto pixelKey = [](const cv::Point& p) -> uint64_t {
@@ -367,10 +382,8 @@ EdgeGraph trace_line(EdgeGraph graph) {
             lookup[pixelKey(cv::Point(point.x, point.y))] = &point;
         }
 
-        // Track connections already traced in this component
         std::unordered_set<EdgeKey, PixelPairHash> visitedEdges;
 
-        // Trace a path beginning with one particular connection
         auto traceFrom = [&](const cv::Point& start,
                              const cv::Point& firstNeighbor) {
 
@@ -390,8 +403,6 @@ EdgeGraph trace_line(EdgeGraph graph) {
 
                 traced.pixels.push_back(current);
 
-                // Returning to the starting pixel means
-                // this traced path is closed
                 if (current == start) {
                     traced.closed = true;
                     break;
@@ -405,7 +416,6 @@ EdgeGraph trace_line(EdgeGraph graph) {
 
                 const EdgePoint* currentPoint = it->second;
 
-                // Stop at an endpoint or junction
                 if (currentPoint->type == PointType::ENDPOINT ||
                     currentPoint->type == PointType::JUNCTION) {
                     break;
@@ -444,7 +454,6 @@ EdgeGraph trace_line(EdgeGraph graph) {
             graph.tracedLines.push_back(std::move(traced));
         };
 
-        // STEP 1: Start at endpoints and junctions
         for (const EdgePoint& point : component.points) {
 
             if (point.type != PointType::ENDPOINT &&
@@ -464,8 +473,6 @@ EdgeGraph trace_line(EdgeGraph graph) {
             }
         }
 
-        // STEP 2: Trace remaining connections
-        // This catches closed loops without endpoints
         for (const EdgePoint& point : component.points) {
 
             cv::Point start(point.x, point.y);
@@ -480,7 +487,6 @@ EdgeGraph trace_line(EdgeGraph graph) {
             }
         }
 
-        // STEP 3: Handle isolated pixels
         for (const EdgePoint& point : component.points) {
 
             if (point.type == PointType::ISOLATED) {
@@ -516,7 +522,6 @@ cv::Mat create_edge_map(const EdgeData& data) {
 
     for (const auto& [dx, dy] : data.pixel_dist) {
 
-        // Reverse normalization
         double originalDX = dx * centerX;
         double originalDY = dy * centerY;
 
@@ -538,61 +543,117 @@ cv::Mat create_edge_map(const EdgeData& data) {
     return edgeMap;
 }
 
-int main() {
+//if a pixel has multiple neighbors, reduce the region of neighbors into one component
+EdgeGraph reduce_junctions(EdgeGraph graph) {
 
-    std::cout << "Program started!" << std::endl;
+    int regionID = 0;
 
-    std::string testPath =
-        R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
+    for (const EdgeComponent& component : graph.components) {
+//search for components with many shared connections
+        std::unordered_map<uint64_t, const EdgePoint*> lookup;
+        std::unordered_set<uint64_t> visited;
 
-    // STEP 1: Detect edge pixels
-    EdgeData edges = edge_encoder(testPath);
-
-    if (edges.width == 0 || edges.height == 0) {
-        std::cerr << "Failed to load image." << std::endl;
-        return 1;
-    }
-
-    // STEP 2: Normalize edge coordinates
-    EdgeData test_edges = normalize(edges);
-
-    // STEP 3: Reconstruct binary edge map
-    cv::Mat edgeMap = create_edge_map(test_edges);
-
-    // STEP 4: Find connected components
-    EdgeGraph graph = draw_line(edgeMap);
-
-    // STEP 5: Trace individual paths
-    graph = trace_line(std::move(graph));
-
-    // STEP 6: Print results
-    std::cout << "Connected components: "
-              << graph.components.size() << std::endl;
-
-    std::cout << "Traced lines: "
-              << graph.tracedLines.size() << std::endl;
-
-    int closedLoops = 0;
-
-    for (const TracedLine& line : graph.tracedLines) {
-
-        if (line.closed) {
-            closedLoops++;
+        for (const EdgePoint& pixel : component.points) {
+            lookup[pixelKey(pixel.x, pixel.y)] = &pixel;
         }
 
-        std::cout << "Line " << line.id
-                  << " | Component: " << line.componentID
-                  << " | Pixels: " << line.pixels.size()
-                  << " | Closed: " << (line.closed ? "Yes" : "No")
-                  << std::endl;
+        for (const EdgePoint& pixel : component.points) {
+
+            if (pixel.neighbors.size() < 4) {
+                continue;
+            }
+
+            uint64_t key = pixelKey(pixel.x, pixel.y);
+
+             //track which pixels have been accounted for
+            if (visited.count(key)) {
+                continue;
+            }
+             //reduce to one component, pixel region
+            PixelRegion region;
+            region.id = regionID++;
+            region.componentID = component.id;
+
+            //bfs to reconnect lines together
+            std::queue<cv::Point> queue;
+            queue.push(cv::Point(pixel.x, pixel.y));
+
+            visited.insert(key);
+
+            while (!queue.empty()) {
+                cv::Point current = queue.front();
+                queue.pop();
+                region.pixels.push_back(current);
+
+                uint64_t currentKey = pixelKey(current.x, current.y);
+                const EdgePoint* currentPixel = lookup.at(currentKey);
+
+                for (const cv::Point& neighbor : currentPixel->neighbors) {
+                    uint64_t neighborKey = pixelKey(neighbor.x, neighbor.y);
+
+                    if (visited.count(neighborKey)) {
+                        continue;
+                    }
+                    auto it = lookup.find(neighborKey);
+
+                    if (it == lookup.end()) {
+                        continue;
+                    }
+                    const EdgePoint* neighborPixel = it->second;
+
+                    if (neighborPixel->neighbors.size() >= 4) {
+                        visited.insert(neighborKey);
+                        queue.push(neighbor);
+                    }
+                }
+            }
+
+            graph.regions.push_back(std::move(region));
+        }
     }
 
-    std::cout << "Closed loops: "
-              << closedLoops << std::endl;
+    return graph;
+}
 
-    // STEP 7: Display the binary edge map
-    cv::imshow("Edge Map", edgeMap);
+
+int main() {
+
+    std::string path =
+    R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
+
+    EdgeData data = edge_encoder(path);
+
+    EdgeData normalized = normalize(data);
+
+    cv::Mat edgeMap = create_edge_map(normalized);
+
+    cv::imshow("Original Edge Map", edgeMap);
+
+    cv::Mat skeleton;
+    cv::ximgproc::thinning(edgeMap,skeleton,cv::ximgproc::THINNING_ZHANGSUEN);
+    cv::imshow("Skeletonized Edge Map", skeleton);
+
+    EdgeGraph graph = draw_component(skeleton);
+
+    graph = reduce_junctions(std::move(graph));
+
+    graph = trace_line(std::move(graph));
+
+    cv::Mat regionDisplay;
+    cv::cvtColor(skeleton, regionDisplay, cv::COLOR_GRAY2BGR);
+
+    for (const PixelRegion& region : graph.regions) {
+        for (const cv::Point& pixel : region.pixels) {
+            regionDisplay.at<cv::Vec3b>(pixel.y, pixel.x) =
+                cv::Vec3b(0, 0, 255);
+        }
+    }
+
+    cv::imshow("Junction Regions", regionDisplay);
+
+
     cv::waitKey(0);
+    cv::destroyAllWindows();
 
     return 0;
 }
