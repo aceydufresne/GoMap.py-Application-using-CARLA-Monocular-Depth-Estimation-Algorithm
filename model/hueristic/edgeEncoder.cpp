@@ -1,5 +1,8 @@
-#include<opencv2/opencv.hpp>
-#include<iostream>
+#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/ximgproc.hpp>
+
+#include <iostream>
 #include <string>
 #include <vector>
 #include <tuple>
@@ -10,7 +13,22 @@
 #include <queue>
 #include <unordered_set>
 #include <cmath>
-#include <opencv2/ximgproc.hpp>
+
+
+//this is for when we transform the pixels coordinates into function plots
+struct FittedLine {
+    int id;
+    int componentID;
+
+    std::vector<cv::Point> pixels;
+
+    double slope = 0.0;
+    double intercept = 0.0;
+    //70% accuracy of all pixels in the component.
+    double accuracy = 0.0;
+
+    bool vertical = false;
+};
 
 //pixels with edge neighbors that are not lines
 struct RegionConnection {
@@ -77,8 +95,9 @@ struct EdgeComponent {
 struct EdgeGraph {
     std::vector<EdgeComponent> components;
     std::vector<TracedLine> tracedLines;
-
     std::vector<PixelRegion> regions;
+
+    std::vector<FittedLine> fittedLines;
 };
 
 using EdgeKey = std::pair<uint64_t, uint64_t>;
@@ -94,6 +113,7 @@ struct EdgeData {
     int width = 0;
     std::vector<std::pair<double, double>> pixel_dist;
 };
+
 
 
 
@@ -616,44 +636,349 @@ EdgeGraph reduce_junctions(EdgeGraph graph) {
 }
 
 
+
+EdgeGraph convert_graph(EdgeGraph graph) {
+    const double minimumAccuracy = 0.70;
+    const double tolerance = 1.0; // Perpendicular distance in image pixels.
+    graph.fittedLines.clear();
+    int nextID = 0;
+
+    // Fit a robust, constant-direction line, including vertical lines.
+    struct Fit {
+        cv::Point2d origin;
+        cv::Point2d direction;
+        double accuracy = 0.0;
+    };
+    auto distance = [](const cv::Point& p, const Fit& f) {
+        return std::abs((p.x - f.origin.x) * f.direction.y -
+                        (p.y - f.origin.y) * f.direction.x);
+    };
+    auto fit = [&](const std::vector<cv::Point>& pixels) {
+        Fit result;
+        if (pixels.size() == 1) {
+            result.origin = cv::Point2d(pixels.front().x, pixels.front().y);
+            result.direction = cv::Point2d(1.0, 0.0);
+            result.accuracy = 1.0;
+            return result;
+        }
+
+    double meanX = 0.0;
+    double meanY = 0.0;
+
+    for (const cv::Point& p : pixels) {
+        meanX += p.x;
+        meanY += p.y;
+    }
+
+    meanX /= pixels.size();
+    meanY /= pixels.size();
+
+    double xx = 0.0;
+    double xy = 0.0;
+    double yy = 0.0;
+
+    for (const cv::Point& p : pixels) {
+        double dx = p.x - meanX;
+        double dy = p.y - meanY;
+
+        xx += dx * dx;
+        xy += dx * dy;
+        yy += dy * dy;
+    }
+
+    double angle = 0.5 * std::atan2(
+        2.0 * xy,
+        xx - yy
+    );
+
+    result.origin = cv::Point2d(meanX, meanY);
+
+    result.direction = cv::Point2d(
+        std::cos(angle),
+        std::sin(angle)
+    );
+
+        size_t matches = 0;
+        for (const auto& p : pixels)
+            if (distance(p, result) <= tolerance) ++matches;
+        result.accuracy = static_cast<double>(matches) / pixels.size();
+        return result;
+    };
+    auto save = [&](int componentID, const std::vector<cv::Point>& pixels) {
+        const Fit model = fit(pixels);
+        FittedLine line{};
+        line.id = nextID++;
+        line.componentID = componentID;
+        line.pixels = pixels;
+        line.accuracy = model.accuracy;
+        line.vertical = std::abs(model.direction.x) < 1e-6;
+        if (line.vertical) {
+            // For vertical lines, intercept stores x = intercept.
+            line.intercept = model.origin.x;
+        } else {
+            line.slope = model.direction.y / model.direction.x;
+            line.intercept = model.origin.y - line.slope * model.origin.x;
+        }
+        graph.fittedLines.push_back(std::move(line));
+    };
+
+    for (const EdgeComponent& component : graph.components) {
+        std::unordered_map<uint64_t, const EdgePoint*> lookup;
+        for (const auto& p : component.points)
+            lookup[pixelKey(p.x, p.y)] = &p;
+        auto key = [](const cv::Point& p) { return pixelKey(p.x, p.y); };
+        auto edgeKey = [&](const cv::Point& a, const cv::Point& b) -> EdgeKey {
+            const uint64_t ka = key(a), kb = key(b);
+            return {std::min(ka, kb), std::max(ka, kb)};
+        };
+        std::unordered_set<EdgeKey, PixelPairHash> used;
+        auto neighbors = [&](const cv::Point& p) {
+            std::vector<cv::Point> result;
+            const auto it = lookup.find(key(p));
+            if (it != lookup.end()) {
+                for (const auto& n : it->second->neighbors)
+                    if (lookup.count(key(n)) && n != p &&
+                        !used.count(edgeKey(p, n))) result.push_back(n);
+            }
+            return result;
+        };
+
+        auto trace = [&](const cv::Point& start) {
+            std::vector<cv::Point> pixels{start};
+            // Pointers refer to stable EdgePoint objects, never vector elements.
+            const EdgePoint* tail = lookup.at(key(start));
+            const EdgePoint* tempHead = tail;
+            cv::Point current = start;
+            while (true) {
+                const auto options = neighbors(current);
+                if (options.empty()) break;
+
+                // BFS through a junction cluster. For each exit, retain its
+                // shortest route independently. Do not consume rejected routes.
+                std::vector<std::vector<cv::Point>> routes;
+                std::queue<std::vector<cv::Point>> pending;
+                std::unordered_set<uint64_t> discovered{key(current)};
+                for (const auto& n : options) {
+                    if (discovered.insert(key(n)).second) pending.push({n});
+                }
+                while (!pending.empty()) {
+                    auto route = std::move(pending.front());
+                    pending.pop();
+                    const cv::Point end = route.back();
+                    const auto next = neighbors(end);
+                    if (lookup.at(key(end))->neighbors.size() <= 2 || next.empty()) {
+                        routes.push_back(std::move(route));
+                        continue;
+                    }
+                    bool expanded = false;
+                    for (const auto& n : next) {
+                        if (!discovered.insert(key(n)).second) continue;
+                        auto extension = route;
+                        extension.push_back(n);
+                        pending.push(std::move(extension));
+                        expanded = true;
+                    }
+                    if (!expanded) routes.push_back(std::move(route));
+                }
+
+                size_t best = routes.size();
+                double bestError = 0.0;
+                for (size_t i = 0; i < routes.size(); ++i) {
+                    auto trial = pixels;
+                    bool accepted = true;
+                    double error = 0.0;
+                    for (const auto& p : routes[i]) {
+                        trial.push_back(p);
+                        const Fit model = fit(trial);
+                        // Require 70% of the PREVIOUS pixels, and explicitly
+                        // require the new head and fixed tail to remain inliers.
+                        size_t previousMatches = 0;
+                        for (size_t j = 0; j + 1 < trial.size(); ++j)
+                            if (distance(trial[j], model) <= tolerance)
+                                ++previousMatches;
+                        if (static_cast<double>(previousMatches) /
+                                (trial.size() - 1) < minimumAccuracy ||
+                            distance(p, model) > tolerance ||
+                            distance(cv::Point(tail->x, tail->y), model) > tolerance) {
+                            accepted = false;
+                            break;
+                        }
+                        error += distance(p, model);
+                    }
+                    if (accepted && (best == routes.size() ||
+                        routes[i].size() < routes[best].size() ||
+                        (routes[i].size() == routes[best].size() && error < bestError))) {
+                        best = i;
+                        bestError = error;
+                    }
+                }
+                if (best == routes.size()) {
+                    // A cluster exit can fail even when its first few pixels
+                    // fit. Try each immediate neighbor before splitting.
+                    for (const auto& n : options) {
+                        auto trial = pixels;
+                        trial.push_back(n);
+                        const Fit model = fit(trial);
+                        size_t matches = 0;
+                        for (const auto& p : pixels)
+                            if (distance(p, model) <= tolerance) ++matches;
+                        if (static_cast<double>(matches) / pixels.size() >= minimumAccuracy &&
+                            distance(n, model) <= tolerance &&
+                            distance(cv::Point(tail->x, tail->y), model) <= tolerance) {
+                            routes.push_back({n});
+                            best = routes.size() - 1;
+                            break;
+                        }
+                    }
+                }
+                if (best == routes.size()) {
+                    save(component.id, pixels);
+                    // Share the last accepted pixel to keep segments connected.
+                    pixels.assign(1, current);
+                    tail = lookup.at(key(current));
+                    // Two distinct pixels always define an acceptable line.
+                    const cv::Point n = options.front();
+                    used.insert(edgeKey(current, n));
+                    pixels.push_back(n);
+                    current = n;
+                    tempHead = lookup.at(key(current));
+                    continue;
+                }
+                for (const auto& p : routes[best]) {
+                    used.insert(edgeKey(current, p));
+                    pixels.push_back(p);
+                    current = p;
+                    tempHead = lookup.at(key(current));
+                }
+                if (tempHead == tail) break; // Closed loop.
+            }
+            if (pixels.size() > 1) save(component.id, pixels);
+        };
+
+        // Start at endpoints, then cover branches, cycles and cluster remnants.
+        for (const auto& p : component.points) {
+            const cv::Point start(p.x, p.y);
+            if (p.neighbors.empty()) save(component.id, {start});
+            else if (p.neighbors.size() == 1 && !neighbors(start).empty()) trace(start);
+        }
+        for (const auto& p : component.points) {
+            const cv::Point start(p.x, p.y);
+            while (!neighbors(start).empty()) trace(start);
+        }
+    }
+    return graph;
+}
+
+
+
+double calculate_accuracy(
+    const std::vector<cv::Point>& visitedPixels,
+    double m,
+    double b,
+    bool vertical,
+    double verticalX,
+    double tolerance = 1.0
+) {
+    if (visitedPixels.empty()) {
+        return 0.0;
+    }
+    int matches = 0;
+
+    for (const cv::Point& pixel : visitedPixels) {
+        double distance;
+        if (vertical) {
+            distance = std::abs(pixel.x - verticalX);
+        }
+        else {
+            distance = std::abs(
+                m * pixel.x - pixel.y + b
+            ) / std::sqrt(m * m + 1.0);
+        }
+        if (distance <= tolerance) {
+            matches++;
+        }
+    }
+    return static_cast<double>(matches)
+         / visitedPixels.size();
+}
+
+
+
+
 int main() {
 
     std::string path =
-    R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
+        R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
 
+    // Step 1: Sobel edge detection
     EdgeData data = edge_encoder(path);
+
+    if (data.width == 0 || data.height == 0) {
+        return 1;
+    }
 
     EdgeData normalized = normalize(data);
 
     cv::Mat edgeMap = create_edge_map(normalized);
 
-    cv::imshow("Original Edge Map", edgeMap);
-
+    // Step 2: Skeletonize the edge map
     cv::Mat skeleton;
-    cv::ximgproc::thinning(edgeMap,skeleton,cv::ximgproc::THINNING_ZHANGSUEN);
-    cv::imshow("Skeletonized Edge Map", skeleton);
 
+    cv::ximgproc::thinning(
+        edgeMap,
+        skeleton,
+        cv::ximgproc::THINNING_ZHANGSUEN
+    );
+
+    // Step 3: Build the skeleton graph
     EdgeGraph graph = draw_component(skeleton);
 
     graph = reduce_junctions(std::move(graph));
-
     graph = trace_line(std::move(graph));
 
-    cv::Mat regionDisplay;
-    cv::cvtColor(skeleton, regionDisplay, cv::COLOR_GRAY2BGR);
+    // Step 4: Convert graph into fitted lines
+    graph = convert_graph(std::move(graph));
 
-    for (const PixelRegion& region : graph.regions) {
-        for (const cv::Point& pixel : region.pixels) {
-            regionDisplay.at<cv::Vec3b>(pixel.y, pixel.x) =
-                cv::Vec3b(0, 0, 255);
+    // Step 5: Create a blank image for fitted lines
+    cv::Mat fittedMap = cv::Mat::zeros(
+        skeleton.size(),
+        CV_8UC1
+    );
+
+    // Draw each fitted line
+    for (const FittedLine& line : graph.fittedLines) {
+
+        if (line.pixels.empty()) {
+            continue;
         }
+
+        // Draw the fitted mathematical segment between
+        // the first and last pixels
+        cv::Point start = line.pixels.front();
+        cv::Point end = line.pixels.back();
+
+        cv::line(
+            fittedMap,
+            start,
+            end,
+            cv::Scalar(255),
+            1,
+            cv::LINE_8
+        );
     }
 
-    cv::imshow("Junction Regions", regionDisplay);
+    // Step 6: Display all three maps
+    cv::imshow("1 - Original Edge Map", edgeMap);
+    cv::imshow("2 - Skeleton Edge Map", skeleton);
+    cv::imshow("3 - Fitted Edge Map", fittedMap);
 
+    std::cout << "Fitted lines: "
+              << graph.fittedLines.size()
+              << std::endl;
 
     cv::waitKey(0);
     cv::destroyAllWindows();
 
     return 0;
 }
+
