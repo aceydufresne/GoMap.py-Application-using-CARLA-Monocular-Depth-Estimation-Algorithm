@@ -902,7 +902,279 @@ double calculate_accuracy(
          / visitedPixels.size();
 }
 
+EdgeGraph merge_lines(
+    EdgeGraph graph,
+    double maxEndpointGap = 2.0,    // Pixels
+    double maxAngleDegrees = 10.0,
+    double tolerance = 1.0,         // Perpendicular distance in pixels
+    double minimumAccuracy = 0.70
+) {
+    if (maxEndpointGap < 0.0 ||
+        maxAngleDegrees <= 0.0 || maxAngleDegrees > 90.0 ||
+        tolerance <= 0.0 ||
+        minimumAccuracy <= 0.0 || minimumAccuracy > 1.0) {
+        CV_Error(cv::Error::StsBadArg, "Invalid merge_lines thresholds");
+    }
 
+    struct Model {
+        cv::Point2d origin;
+        cv::Point2d direction;
+    };
+
+    auto fit = [](const std::vector<cv::Point>& pixels) {
+        cv::Vec4f result;
+        cv::fitLine(
+            pixels, result,
+            cv::DIST_L1, 0.0, 0.01, 0.01
+        );
+
+        Model model;
+        model.origin = cv::Point2d(result[2], result[3]);
+
+        const double length = std::hypot(result[0], result[1]);
+        model.direction = cv::Point2d(
+            result[0] / length,
+            result[1] / length
+        );
+
+        return model;
+    };
+
+    auto distance = [](const cv::Point& p, const Model& model) {
+        const double dx = p.x - model.origin.x;
+        const double dy = p.y - model.origin.y;
+
+        return std::abs(
+            dx * model.direction.y -
+            dy * model.direction.x
+        );
+    };
+
+    auto accuracy = [&](const std::vector<cv::Point>& pixels,
+                        const Model& model) {
+        size_t matches = 0;
+
+        for (const auto& p : pixels) {
+            if (distance(p, model) <= tolerance) {
+                ++matches;
+            }
+        }
+
+        return pixels.empty()
+            ? 0.0
+            : static_cast<double>(matches) / pixels.size();
+    };
+
+    // Find the full extent along the fitted direction.
+    // This also works when the input pixels are not ordered.
+    auto endpoints = [](const std::vector<cv::Point>& pixels,
+                        const Model& model) {
+        auto projection = [&](const cv::Point& p) {
+            return (p.x - model.origin.x) * model.direction.x +
+                   (p.y - model.origin.y) * model.direction.y;
+        };
+
+        double minimum = projection(pixels.front());
+        double maximum = minimum;
+
+        for (const auto& p : pixels) {
+            const double t = projection(p);
+            minimum = std::min(minimum, t);
+            maximum = std::max(maximum, t);
+        }
+
+        return std::make_pair(
+            model.origin + model.direction * minimum,
+            model.origin + model.direction * maximum
+        );
+    };
+
+    auto pointDistance = [](const cv::Point2d& a,
+                            const cv::Point2d& b) {
+        return std::hypot(a.x - b.x, a.y - b.y);
+    };
+
+    auto& lines = graph.fittedLines;
+    const double radiansToDegrees = 180.0 / std::acos(-1.0);
+
+    while (true) {
+        // Cache fits once per merge iteration.
+        std::vector<Model> models(lines.size());
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (lines[i].pixels.size() >= 2) {
+                models[i] = fit(lines[i].pixels);
+            }
+        }
+
+        size_t bestI = lines.size();
+        size_t bestJ = lines.size();
+        double bestScore = 0.0;
+        FittedLine bestMerged{};
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (lines[i].pixels.size() < 2) {
+                continue;
+            }
+
+            const auto endsA = endpoints(lines[i].pixels, models[i]);
+
+            for (size_t j = i + 1; j < lines.size(); ++j) {
+                if (lines[j].pixels.size() < 2 ||
+                    lines[i].componentID != lines[j].componentID) {
+                    continue;
+                }
+
+                // Absolute dot product treats opposite traversal
+                // directions as the same line orientation.
+                double cosine = std::abs(
+                    models[i].direction.dot(models[j].direction)
+                );
+                cosine = std::max(0.0, std::min(1.0, cosine));
+
+                const double angle =
+                    std::acos(cosine) * radiansToDegrees;
+
+                if (angle > maxAngleDegrees) {
+                    continue;
+                }
+
+                const auto endsB =
+                    endpoints(lines[j].pixels, models[j]);
+
+                const double gap = std::min(
+                    std::min(
+                        pointDistance(endsA.first, endsB.first),
+                        pointDistance(endsA.first, endsB.second)
+                    ),
+                    std::min(
+                        pointDistance(endsA.second, endsB.first),
+                        pointDistance(endsA.second, endsB.second)
+                    )
+                );
+
+                if (gap > maxEndpointGap) {
+                    continue;
+                }
+
+                // Combine pixels without counting shared pixels twice.
+                std::vector<cv::Point> combined = lines[i].pixels;
+                combined.insert(
+                    combined.end(),
+                    lines[j].pixels.begin(),
+                    lines[j].pixels.end()
+                );
+
+                std::sort(
+                    combined.begin(), combined.end(),
+                    [](const cv::Point& a, const cv::Point& b) {
+                        return a.x < b.x ||
+                               (a.x == b.x && a.y < b.y);
+                    }
+                );
+
+                combined.erase(
+                    std::unique(combined.begin(), combined.end()),
+                    combined.end()
+                );
+
+                const Model mergedModel = fit(combined);
+
+                // Prevent a long segment from overwhelming a shorter one.
+                if (accuracy(lines[i].pixels, mergedModel) < minimumAccuracy ||
+                    accuracy(lines[j].pixels, mergedModel) < minimumAccuracy) {
+                    continue;
+                }
+
+                const double mergedAccuracy =
+                    accuracy(combined, mergedModel);
+
+                if (mergedAccuracy < minimumAccuracy) {
+                    continue;
+                }
+
+                double meanError = 0.0;
+                for (const auto& p : combined) {
+                    meanError += distance(p, mergedModel);
+                }
+                meanError /= combined.size();
+
+                // Lower score means better compatibility.
+                // Normalize terms so pixels and degrees are comparable.
+                const double score =
+                    angle / maxAngleDegrees +
+                    gap / std::max(maxEndpointGap, 1e-9) +
+                    meanError / tolerance;
+
+                if (bestI != lines.size() && score >= bestScore) {
+                    continue;
+                }
+
+                // Order pixels along the merged line so front/back
+                // describe its full extent for drawing.
+                std::sort(
+                    combined.begin(), combined.end(),
+                    [&](const cv::Point& a, const cv::Point& b) {
+                        const double ta =
+                            (a.x - mergedModel.origin.x) *
+                                mergedModel.direction.x +
+                            (a.y - mergedModel.origin.y) *
+                                mergedModel.direction.y;
+
+                        const double tb =
+                            (b.x - mergedModel.origin.x) *
+                                mergedModel.direction.x +
+                            (b.y - mergedModel.origin.y) *
+                                mergedModel.direction.y;
+
+                        return ta < tb;
+                    }
+                );
+
+                FittedLine merged{};
+                merged.id = lines[i].id;
+                merged.componentID = lines[i].componentID;
+                merged.pixels = std::move(combined);
+                merged.accuracy = mergedAccuracy;
+
+                merged.vertical =
+                    std::abs(mergedModel.direction.x) < 1e-6;
+
+                if (merged.vertical) {
+                    // Vertical-line convention: x = intercept.
+                    merged.intercept = mergedModel.origin.x;
+                } else {
+                    merged.slope =
+                        mergedModel.direction.y /
+                        mergedModel.direction.x;
+
+                    merged.intercept =
+                        mergedModel.origin.y -
+                        merged.slope * mergedModel.origin.x;
+                }
+
+                bestI = i;
+                bestJ = j;
+                bestScore = score;
+                bestMerged = std::move(merged);
+            }
+        }
+
+        if (bestI == lines.size()) {
+            break;
+        }
+
+        lines[bestI] = std::move(bestMerged);
+        lines.erase(lines.begin() + bestJ);
+    }
+
+    // Restore consecutive IDs after removing merged entries.
+    for (size_t i = 0; i < lines.size(); ++i) {
+        lines[i].id = static_cast<int>(i);
+    }
+
+    return graph;
+}
 
 
 int main() {
