@@ -96,6 +96,9 @@ struct EdgeComponent {
 };
 
 struct EdgeGraph {
+    int width = 0;
+    int height = 0;
+
     std::vector<EdgeComponent> components;
     std::vector<TracedLine> tracedLines;
     std::vector<PixelRegion> regions;
@@ -281,6 +284,8 @@ EdgeGraph draw_component(const cv::Mat& edges) {
 
     int height = edges.rows;
     int width = edges.cols;
+    graph.width = width;
+    graph.height = height;
 
     cv::Mat visited = cv::Mat::zeros(
         height, width, CV_8UC1
@@ -906,14 +911,49 @@ double calculate_accuracy(
 }
 
 
+double calculate_line_length(const FittedLine& line) {
+    if (line.pixels.size() < 2)
+        return 0.0;
 
-EdgeGraph merge_lines(
-    EdgeGraph graph,
-    double maxEndpointGap = 15.0,
-    double maxAngleDegrees = 20.0,
-    double tolerance = 1.0,
-    double minimumAccuracy = 0.75
-) {
+    double angle = line.vertical
+        ? CV_PI / 2.0
+        : std::atan(line.slope);
+
+    double vx = std::cos(angle);
+    double vy = std::sin(angle);
+
+    double minProjection = std::numeric_limits<double>::max();
+    double maxProjection = std::numeric_limits<double>::lowest();
+
+    for (const cv::Point& p : line.pixels) {
+        double projection = p.x * vx + p.y * vy;
+
+        minProjection = std::min(minProjection, projection);
+        maxProjection = std::max(maxProjection, projection);
+    }
+
+    return maxProjection - minProjection;
+}
+
+
+EdgeGraph merge_lines(EdgeGraph graph) {
+
+    double gapPercentage = 0.005;
+    double maxAngleDegrees = 15.0;
+    double tolerance = 1.0;
+    double minimumAccuracy = 0.75;
+
+    if (graph.width <= 0 || graph.height <= 0) {
+        CV_Error(cv::Error::StsBadArg, "Invalid image dimensions");
+    }
+
+    if (gapPercentage < 0.0) {
+        CV_Error(cv::Error::StsBadArg, "Invalid gap percentage");
+    }
+
+    double maxEndpointGap =
+        gapPercentage * std::hypot(graph.width, graph.height);
+
 //double linked list to find intercepts for lines to merge matching slopes
     std::list<FittedLine> lines(graph.fittedLines.begin(),graph.fittedLines.end());
     //testing most optimal merges
@@ -1128,6 +1168,231 @@ EdgeGraph merge_lines(
 }
 
 
+EdgeGraph refine_lines(EdgeGraph graph) {
+    //base case
+    bool merged = true;
+    //largest space allowed
+    double gapPercentage = 0.04;
+    double maxGap = gapPercentage * std::hypot(graph.width, graph.height);
+    double tolerance = 1.0;
+    double minimumAccuracy = 0.95;
+    double maxAngleDegrees = 10.0;
+
+    std::list<FittedLine> lines(
+        graph.fittedLines.begin(),
+        graph.fittedLines.end()
+    );
+
+    while(merged){
+        merged = false;
+
+        //iterate through the newly merged lines from merge_lines()
+        for(auto first = lines.begin(); first!= lines.end();++first){
+            for(auto second = std::next(first); second!=lines.end();){
+                //distance between line endpoints
+                //double dx = x2 - x1;
+                //double dy = y2 - y1;
+                //double gap = std::sqrt(dx * dx + dy * dy);
+
+                if (first->pixels.size() < 2 ||
+                    second->pixels.size() < 2) {
+                    ++second;
+                    continue;
+                }
+
+                const cv::Point& startA = first->pixels.front();
+                const cv::Point& endA = first->pixels.back();
+
+                const cv::Point& startB = second->pixels.front();
+                const cv::Point& endB = second->pixels.back();
+
+                //shortest space between lines
+                double minGap = std::min({
+                cv::norm(startA - startB),
+                cv::norm(startA - endB),
+                cv::norm(endA - startB),
+                cv::norm(endA - endB)});
+                //if lines are too far apart
+                if(minGap > maxGap){
+                    ++second;
+                    continue;
+                }
+                //check slope comparision
+                double angleA = first->vertical
+                    ? CV_PI / 2.0
+                    : std::atan(first->slope);
+
+                double angleB = second->vertical
+                    ? CV_PI / 2.0
+                    : std::atan(second->slope);
+
+                //absolute value, since 180 == 0
+                double angleDifference = std::abs(angleA - angleB);
+                angleDifference = std::min(
+                    angleDifference,
+                    CV_PI - angleDifference
+                );
+
+                // convert radians to degrees
+                double angleDegrees = angleDifference * 180.0 / CV_PI;
+
+                if (angleDegrees > maxAngleDegrees) {
+                    ++second;
+                    continue;
+                }
+                //temporarily combine lines
+                std::vector<cv::Point> combined = first->pixels;
+
+                combined.insert(
+                    combined.end(),
+                    second->pixels.begin(),
+                    second->pixels.end()
+                );
+
+                // Remove duplicate pixels
+                std::sort(combined.begin(), combined.end(),
+                    [](const cv::Point& a, const cv::Point& b) {
+                        return a.x < b.x ||
+                            (a.x == b.x && a.y < b.y);
+                    });
+
+                combined.erase(std::unique(combined.begin(), combined.end()),combined.end());
+
+                if (combined.size() < 2) {
+                    ++second;
+                    continue;
+                }
+
+                double x0 = 0.0;
+                double y0 = 0.0;
+
+                for (const cv::Point& p : combined) {
+                    x0 += p.x;
+                    y0 += p.y;
+                }
+
+                x0 /= combined.size();
+                y0 /= combined.size();
+
+                double xx = 0.0;
+                double xy = 0.0;
+                double yy = 0.0;
+
+                for (const cv::Point& p : combined) {
+                    double dx = p.x - x0;
+                    double dy = p.y - y0;
+
+                    xx += dx * dx;
+                    xy += dx * dy;
+                    yy += dy * dy;
+                }
+
+                double angle = 0.5 * std::atan2(
+                    2.0 * xy,
+                    xx - yy
+                );
+
+                double vx = std::cos(angle);
+                double vy = std::sin(angle);
+
+                bool vertical = std::abs(vx) < 1e-6;
+                double slope = vertical ? 0.0 : vy / vx;
+
+                double intercept = vertical
+                    ? x0
+                    : y0 - slope * x0;
+                
+                double tolerance = 1.0;
+                double minimumAccuracy = 0.75;
+
+                double accuracy = calculate_accuracy(
+                    combined,
+                    slope,
+                    intercept,
+                    vertical,
+                    x0,
+                    tolerance
+                );
+
+                if (accuracy < minimumAccuracy) {
+                    ++second;
+                    continue;
+                }
+                FittedLine mergedLine{};
+                //if all checks pass, merge lines again
+                mergedLine.id = first->id;
+                mergedLine.componentID = first->componentID;
+
+                mergedLine.pixels = std::move(combined);
+                mergedLine.slope = slope;
+                mergedLine.intercept = intercept;
+                mergedLine.vertical = vertical;
+                mergedLine.accuracy = accuracy;
+
+                std::sort(
+                mergedLine.pixels.begin(),
+                mergedLine.pixels.end(),
+                [vx, vy](const cv::Point& a, const cv::Point& b) {
+                    double projectionA = a.x * vx + a.y * vy;
+                    double projectionB = b.x * vx + b.y * vy;
+
+                    if (projectionA != projectionB)
+                        return projectionA < projectionB;
+
+                    return a.x < b.x ||
+                        (a.x == b.x && a.y < b.y);});
+
+                *first = std::move(mergedLine);
+                second = lines.erase(second);
+                merged = true;
+            }
+        }
+    }
+
+    graph.fittedLines.assign(lines.begin(),lines.end());
+
+    for (size_t i = 0; i < graph.fittedLines.size(); ++i) {
+        graph.fittedLines[i].id = static_cast<int>(i);
+    }
+
+    return graph;
+
+}
+
+EdgeGraph filter_short_lines(
+    EdgeGraph graph,
+    double minimumLengthPercentage = 0.01
+) {
+    double minimumLength =
+        minimumLengthPercentage *
+        std::hypot(graph.width, graph.height);
+
+    std::vector<FittedLine> retained;
+    std::vector<FittedLine> shortLines;
+
+    for (const FittedLine& line : graph.fittedLines) {
+
+        double length = calculate_line_length(line);
+
+        if (length < minimumLength) {
+            shortLines.push_back(line);
+        }
+        else {
+            retained.push_back(line);
+        }
+    }
+
+    std::cout << "Structural lines: "
+              << retained.size() << '\n';
+
+    std::cout << "Short fragments: "
+              << shortLines.size() << '\n';
+
+    // Keep original data for now.
+    // Don't delete the short fragments yet.
+    return graph;
+}
+
 
 
 int main() {
@@ -1263,12 +1528,68 @@ int main() {
     );
 
     drawFittedLines(graph, mergedMap);
+    graph = refine_lines(std::move(graph));
+
+    graph = refine_lines(std::move(graph));
+    graph = filter_short_lines(std::move(graph));
+
+
+    std::cout << "Refined fitted lines: "
+            << graph.fittedLines.size() << std::endl;
+    cv::Mat refinedMap = cv::Mat::zeros(
+        skeleton.size(), CV_8UC1
+    );
+
+    double minimumLength =
+        0.01 * std::hypot(graph.width, graph.height);
+
+    for (const FittedLine& line : graph.fittedLines) {
+        double length = calculate_line_length(line);
+
+        std::cout
+            << "Line " << line.id
+            << " | Length: " << length
+            << " | Accuracy: " << line.accuracy
+            << (length < minimumLength ? " | SHORT" : "")
+            << '\n';
+    }
+
+
+    drawFittedLines(graph, refinedMap);
+
+    for (size_t i = 0; i < graph.fittedLines.size(); ++i) {
+
+    cv::Mat display;
+    cv::cvtColor(skeleton, display, cv::COLOR_GRAY2BGR);
+
+    EdgeGraph singleLineGraph;
+    singleLineGraph.fittedLines.push_back(graph.fittedLines[i]);
+
+    cv::Mat lineMask = cv::Mat::zeros(
+        skeleton.size(), CV_8UC1
+    );
+
+    drawFittedLines(singleLineGraph, lineMask);
+
+    // Red fitted line over white skeleton
+    display.setTo(cv::Scalar(0, 0, 255), lineMask);
+
+    cv::imshow("Individual Refined Line", display);
+
+    int key = cv::waitKey(0);
+
+    if (key == 27) break; // ESC exits
+}
+
+cv::destroyWindow("Individual Refined Line");
+
 
     // Step 8: Display all four stages
     cv::imshow("1 - Original Edge Map", edgeMap);
     cv::imshow("2 - Skeleton Edge Map", skeleton);
     cv::imshow("3 - Fitted Graph Map", fittedMap);
     cv::imshow("4 - Merged Graph Map", mergedMap);
+    cv::imshow("5 - Refined Graph Map", refinedMap);
 
     cv::waitKey(0);
     cv::destroyAllWindows();
