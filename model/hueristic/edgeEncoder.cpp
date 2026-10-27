@@ -17,6 +17,7 @@
 #include <list>
 #include <iterator>
 #include <limits>
+#include <iomanip>
 
 //this is for when we transform the pixels coordinates into function plots
 struct FittedLine {
@@ -996,68 +997,72 @@ EdgeGraph merge_lines(EdgeGraph graph) {
     return std::hypot(dx, dy) <= maxEndpointGap;
     };
 
-    //tolerance threshold
-    //const double slopeTolerance = 0.01;
-    //endpoints intercept tolerance
-    //const double maxEndpointGap = 2.0;
-    
-    //to ensure lines are merged adn reduced as many times as possible we want ot iterate through until we have the optimal solution
-    //this ensures later, every shape receives the same hash function pattern, no matter what order or direction the lines are inputted
+
+
     bool merged = true;
 
-    while(merged){
+    while (merged) {
+
         merged = false;
-    
-        //iterate through the traced lines
-        for (auto first = lines.begin();first != lines.end();++first) {
-            for (auto second = std::next(first);second != lines.end();){
 
-                if (first->componentID != second->componentID) {
-                    ++second;
+        double bestScore = -std::numeric_limits<double>::infinity();
+
+        auto bestFirst = lines.end();
+        auto bestSecond = lines.end();
+
+        FittedLine bestMergedLine{};
+
+        // Evaluate every possible pair before merging
+        for (auto first = lines.begin(); first != lines.end(); ++first) {
+
+            for (auto second = std::next(first);
+                second != lines.end();
+                ++second) {
+
+                if (first->componentID != second->componentID)
                     continue;
-                }
 
-                //base case to ensure we make the optimal merge for all lines in the graph
-                if (first->pixels.size() < 2 || second->pixels.size() < 2) {
-                    ++second;
+                if (first->pixels.size() < 2 ||
+                    second->pixels.size() < 2)
                     continue;
-                }
-                    double angleA = first->vertical
-                        ? CV_PI / 2.0
-                        : std::atan(first->slope);
 
-                    double angleB = second->vertical
-                        ? CV_PI / 2.0
-                        : std::atan(second->slope);
+                double angleA = first->vertical
+                    ? CV_PI / 2.0
+                    : std::atan(first->slope);
 
-                    double angleDifference = std::abs(angleA - angleB);
+                double angleB = second->vertical
+                    ? CV_PI / 2.0
+                    : std::atan(second->slope);
 
-                        //make sure slope is similiar enough
-                    angleDifference = std::min(angleDifference,CV_PI - angleDifference);
-                    double angleDegrees = angleDifference * 180.0 / CV_PI;
-                    //base case to ensure we make the optimal merge for all lines in the graph
-                    bool slopesMatch = angleDegrees <= maxAngleDegrees;
+                double angleDifference = std::abs(angleA - angleB);
 
-                if (!slopesMatch) {
-                    ++second;
+                angleDifference = std::min(
+                    angleDifference,
+                    CV_PI - angleDifference
+                );
+
+                double angleDegrees =
+                    angleDifference * 180.0 / CV_PI;
+
+                if (angleDegrees > maxAngleDegrees)
                     continue;
-                }
+
                 const cv::Point& startA = first->pixels.front();
-                const cv::Point& endA   = first->pixels.back();
+                const cv::Point& endA = first->pixels.back();
+
                 const cv::Point& startB = second->pixels.front();
-                const cv::Point& endB   = second->pixels.back();
+                const cv::Point& endB = second->pixels.back();
 
-                bool endpointsMatch = 
-                        endpointsClose(startA, startB) ||
-                        endpointsClose(startA, endB)   ||
-                        endpointsClose(endA, startB)   ||
-                        endpointsClose(endA, endB);
+                bool endpointsMatch =
+                    endpointsClose(startA, startB) ||
+                    endpointsClose(startA, endB) ||
+                    endpointsClose(endA, startB) ||
+                    endpointsClose(endA, endB);
 
-                if (!endpointsMatch) {
-                    ++second;
-                    continue;}
+                if (!endpointsMatch)
+                    continue;
 
-                //temporailyt combine before the check for accuracy
+                //temporarily combine pixels between teh potential merge
                 std::vector<cv::Point> combined = first->pixels;
 
                 combined.insert(
@@ -1066,24 +1071,29 @@ EdgeGraph merge_lines(EdgeGraph graph) {
                     second->pixels.end()
                 );
 
-                std::sort(combined.begin(), combined.end(),
+                //reemove duplicate pixels
+                std::sort(
+                    combined.begin(),
+                    combined.end(),
                     [](const cv::Point& a, const cv::Point& b) {
-                        return a.x < b.x || (a.x == b.x && a.y < b.y);
-                    });
+                        return a.x < b.x ||
+                            (a.x == b.x && a.y < b.y);
+                    }
+                );
 
-                    //erase duplicated pixels
-                combined.erase(std::unique(combined.begin(), combined.end()),combined.end());
-                
-                if (combined.size() < 2) {
-                    ++second;
+                combined.erase(
+                    std::unique(combined.begin(), combined.end()),
+                    combined.end()
+                );
+
+                if (combined.size() < 2)
                     continue;
-                }
 
-                // Calculate the centroid of all combined pixels
+                //calculate centroid
                 double x0 = 0.0;
                 double y0 = 0.0;
 
-                for (const cv::Point& p : combined) {
+                for (const auto& p : combined) {
                     x0 += p.x;
                     y0 += p.y;
                 }
@@ -1091,12 +1101,13 @@ EdgeGraph merge_lines(EdgeGraph graph) {
                 x0 /= combined.size();
                 y0 /= combined.size();
 
-                // Calculate the covariance components
+                //calculate covariance
                 double xx = 0.0;
                 double xy = 0.0;
                 double yy = 0.0;
 
-                for (const cv::Point& p : combined) {
+                for (const auto& p : combined) {
+
                     double dx = p.x - x0;
                     double dy = p.y - y0;
 
@@ -1105,7 +1116,7 @@ EdgeGraph merge_lines(EdgeGraph graph) {
                     yy += dy * dy;
                 }
 
-                // Find the dominant direction of the fitted line
+                // Fit the combined line using PCA
                 double angle = 0.5 * std::atan2(
                     2.0 * xy,
                     xx - yy
@@ -1117,127 +1128,156 @@ EdgeGraph merge_lines(EdgeGraph graph) {
                 bool vertical = std::abs(vx) < 1e-6;
 
                 double slope = vertical ? 0.0 : vy / vx;
-                double intercept = vertical ? x0 : y0 - slope * x0;
 
-                std::sort(combined.begin(), combined.end(),
+                double intercept = vertical
+                    ? x0
+                    : y0 - slope * x0;
+
+                //sort pixels along the fitted direction
+                std::sort(
+                    combined.begin(),
+                    combined.end(),
                     [=](const cv::Point& a, const cv::Point& b) {
-                        double projectionA = (a.x - x0) * vx + (a.y - y0) * vy;
-                        double projectionB = (b.x - x0) * vx + (b.y - y0) * vy;
 
-                if (projectionA != projectionB)
-                    return projectionA < projectionB;
+                        double projectionA =
+                            (a.x - x0) * vx + (a.y - y0) * vy;
 
-                return a.x < b.x || (a.x == b.x && a.y < b.y);
-                    });
+                        double projectionB =
+                            (b.x - x0) * vx + (b.y - y0) * vy;
 
-                //check accuracy
-                double tempAccuracy = calculate_accuracy(combined, slope, intercept, vertical, x0, tolerance);
-                if (tempAccuracy < minimumAccuracy){
-                    ++second;
+                        if (projectionA != projectionB)
+                            return projectionA < projectionB;
+
+                        return a.x < b.x ||
+                            (a.x == b.x && a.y < b.y);
+                    }
+                );
+
+                //evaluate combined accuracy
+                double tempAccuracy = calculate_accuracy(
+                    combined,
+                    slope,
+                    intercept,
+                    vertical,
+                    x0,
+                    tolerance
+                );
+
+                if (tempAccuracy < minimumAccuracy)
                     continue;
+
+                //use accuracy as the initial merge score
+                double score = tempAccuracy;
+                //dont take the first option if there is a tie in accuracy
+                //use the function which contains more edge pixels
+                if (score > bestScore + 1e-9 ||(std::abs(score - bestScore) <= 1e-9 && combined.size() > bestMergedLine.pixels.size())) {
+
+                    bestScore = score;
+
+                    bestFirst = first;
+                    bestSecond = second;
+
+                    bestMergedLine = FittedLine{};
+
+                    bestMergedLine.id = first->id;
+                    bestMergedLine.componentID = first->componentID;
+                    bestMergedLine.pixels = std::move(combined);
+                    bestMergedLine.slope = slope;
+                    bestMergedLine.intercept = intercept;
+                    bestMergedLine.vertical = vertical;
+                    bestMergedLine.accuracy = tempAccuracy;
                 }
-                else{
-                    //begin merge
-                    FittedLine mergedLine{};
-                    mergedLine.id = first->id;
-                    mergedLine.componentID = first->componentID;
-                    mergedLine.pixels = std::move(combined);
-                    mergedLine.slope = slope;
-                    mergedLine.intercept = intercept;
-                    mergedLine.vertical = vertical;
-                    mergedLine.accuracy = tempAccuracy;
+            }
+        }
 
-                    *first = std::move(mergedLine);
-                    second = lines.erase(second);
-                    merged = true;
-                    ++mergeCount;
-                }}}
+        // Only merge after every pair has been evaluated
+        if (bestFirst != lines.end() &&
+            bestSecond != lines.end()) {
+
+            *bestFirst = std::move(bestMergedLine);
+
+            lines.erase(bestSecond);
+
+            merged = true;
+            ++mergeCount;
+        }
     }
     
-    // Reassign line IDs
-    for (size_t i = 0; i < graph.fittedLines.size(); ++i) {
-        graph.fittedLines[i].id = static_cast<int>(i);
-    }
-    std::cout << "Successful merges: " << mergeCount << '\n';
-    
-
 
     //for the short line segments and artifacting
     std::vector<FittedLine> shortLines;
     std::vector<FittedLine> longLines;
+    std::vector<FittedLine> remainingShortLines;
 
+    int absorbedPixels = 0;
+    //separate short and long lines
     for (const auto& line : lines) {
-        if (line.pixels.size() < 10) {
+        if (line.pixels.size() < 20) {
             shortLines.push_back(line);
         }
-        else{
+        else {
             longLines.push_back(line);
         }
     }
+    //iterate through individual pixels in line segements of lines smaller than 10 pixels
+    for (const auto& shortLine : shortLines) {
 
-    std::vector<FittedLine> remainingShortLines;
-    for (const auto& shortLine : shortLines){
-        bool absorbed = false;
-        for(auto& longLine: longLines){
+    FittedLine remaining = shortLine;
+    remaining.pixels.clear();
+
+    for (const auto& pixel : shortLine.pixels) {
+        //dont take the first best option, find the closest function
+        int bestIndex = -1;
+        double bestDistance = std::numeric_limits<double>::infinity();
+
+        //find distance from the current long line function
+        for (size_t i = 0; i < longLines.size(); ++i) {
+
+            const auto& longLine = longLines[i];
             //sanity check
-            if (shortLine.componentID != longLine.componentID){
+            if (shortLine.componentID != longLine.componentID) {
                 continue;
             }
-            if (longLine.pixels.empty()){
-                continue;
-            }
-            bool close =endpointsClose(shortLine.pixels.front(), longLine.pixels.front()) ||endpointsClose(shortLine.pixels.front(), longLine.pixels.back()) ||endpointsClose(shortLine.pixels.back(), longLine.pixels.front()) ||endpointsClose(shortLine.pixels.back(), longLine.pixels.back());
-            if(!close){
-                continue;
-            }
-            int matchingPixels = 0;
-            
-            //check the pixel coordinates to see if the any pixels from short segments can be combined
-            for(const auto& pixel : shortLine.pixels){
-                double distance;
-                if(longLine.vertical){
-                    distance = std:: abs(pixel.x - longLine.intercept);
 
-                }else{
-                    //d = |mx - y + b| / sqrt(m^2 + 1)
-                    distance = std::abs(longLine.slope * pixel.x - pixel.y + longLine.intercept) / sqrt(longLine.slope * longLine.slope + 1.0);
-                }
-                //pixel has a range it can be in, as pixels wont be perfectly linear like vectors
-                if (distance <= tolerance){
-                    ++matchingPixels;
-                }
+            double distance;
+
+            if (longLine.vertical) {
+                distance = std::abs(pixel.x - longLine.intercept);
             }
-            double accuracy = static_cast<double>(matchingPixels) / shortLine.pixels.size();
-                
-                //all checks pass, we can merge
-            if(accuracy < minimumAccuracy){
-                continue;}
-            std::vector<cv::Point> combined = longLine.pixels;
-            combined.insert(combined.end(), shortLine.pixels.begin(), shortLine.pixels.end());
-                //remove duplicates
-            std::sort(combined.begin(), combined.end(), [](const cv::Point& a, const cv::Point& b){
-                return a.x < b.x || (a.x ==b.x && a.y < b.y);
-                });
-            combined.erase(std::unique(combined.begin(), combined.end()), combined.end());
-                //check the accuracy of the newly calculated function
-            double combinedAccuracy = calculate_accuracy(combined, longLine.slope, longLine.intercept, longLine.vertical, 0.0, tolerance);
-            if (combinedAccuracy < minimumAccuracy){
-                    continue;
+            else {
+                double predicted =
+                    longLine.slope * pixel.x + longLine.intercept;
+
+                distance = std::abs(pixel.y - predicted) /
+                    std::sqrt(1.0 + longLine.slope * longLine.slope);
             }
-                // new checks passed
-                //merge the passing pixels
-            longLine.pixels = std::move(combined);
-            longLine.accuracy = combinedAccuracy;
-            absorbed = true;
-            ++mergeCount;
-            break;
-        }    
-            if(!absorbed){
-                remainingShortLines.push_back(shortLine);
+            // closest match
+            if (distance <= tolerance &&
+                distance < bestDistance) {
+
+                bestDistance = distance;
+                bestIndex = static_cast<int>(i);
             }
+        }
+
+         // wait to merge until all other functions have been checked
+        if (bestIndex != -1) {
+            longLines[bestIndex].pixels.push_back(pixel);
+            ++absorbedPixels;
+        }
+        else {
+            remaining.pixels.push_back(pixel);
+        }
+    }
+
+    //pixels that dont have matches are kept
+    if (!remaining.pixels.empty()) {
+        remainingShortLines.push_back(std::move(remaining));
+    }
+}    
 
         
-    }
+    
     graph.fittedLines = std::move(longLines);
     graph.fittedLines.insert(
         graph.fittedLines.end(),
@@ -1252,8 +1292,12 @@ EdgeGraph merge_lines(EdgeGraph graph) {
 
     std::cout << "Total successful merges: "
             << mergeCount << '\n';
+    std::cout << "Absorbed short-line pixels: "
+          << absorbedPixels << '\n';
+
     return graph;
 }
+
 
 
 
@@ -1265,15 +1309,273 @@ EdgeGraph merge_lines(EdgeGraph graph) {
 
 int main() {
 
-    std::string path = R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
+    std::string path =
+        R"(F:\CARLA set\renders\sketchfab\0a1b51688d5f474bba3d306b872a3dc8\003.png)";
+
     EdgeData data = edge_encoder(path);
 
     if (data.width == 0 || data.height == 0) {
         return 1;
     }
 
+    // Normalize edge coordinates
     EdgeData normalized = normalize(data);
-    cv::Mat edgeMap = create_edge_map(normalized);
 
+    // Reconstruct the edge map
+    cv::Mat edgeMap = create_edge_map(normalized);
+    cv::Mat skeleton;
+
+    cv::ximgproc::thinning(
+        edgeMap,
+        skeleton,
+        cv::ximgproc::THINNING_ZHANGSUEN
+    );
+    // Create connected components
+    EdgeGraph graph = draw_component(skeleton);
+
+    // Trace individual lines
+    graph = trace_line(graph);
+
+    // Identify junction regions
+    graph = reduce_junctions(graph);
+
+    // Convert traced structures into fitted functions
+    graph = convert_graph(graph);
+    std::cout << "Original fitted functions: "
+          << graph.fittedLines.size() << '\n';
+    // Merge fitted lines and absorb short-line pixels
+    EdgeGraph mergedGraph = merge_lines(graph);
+
+    std::cout << std::fixed << std::setprecision(6);
+
+    std::cout << "\n========== FITTED FUNCTIONS ==========\n";
+
+    for (const auto& line : mergedGraph.fittedLines) {
+
+
+        if (!line.pixels.empty()) {
+
+            const auto& start = line.pixels.front();
+            const auto& end = line.pixels.back();
+
+            std::cout << "Stored start: ("
+                    << start.x << ", " << start.y << ")\n";
+
+            std::cout << "Stored end: ("
+                    << end.x << ", " << end.y << ")\n";
+        }
+
+        if (line.pixels.empty())
+            continue;
+
+        std::cout << "\nLine " << line.id << '\n';
+
+        if (line.vertical) {
+            std::cout << "Equation: x = "
+                    << line.intercept << '\n';
+        }
+        else {
+            std::cout << "Equation: y = "
+                    << line.slope << "x ";
+
+            if (line.intercept >= 0)
+                std::cout << "+ " << line.intercept;
+            else
+                std::cout << "- " << std::abs(line.intercept);
+
+            std::cout << '\n';
+        }
+
+        std::cout << "Pixels: " << line.pixels.size() << '\n';
+        std::cout << "Accuracy: " << line.accuracy << '\n';
+        std::cout << "Component: " << line.componentID << '\n';
+        std::cout << "Length: " << calculate_line_length(line) << '\n';
+    }
+
+    std::cout << "Total fitted functions used to draw image: "
+          << mergedGraph.fittedLines.size()
+          << '\n';
+
+    for (const auto& line : mergedGraph.fittedLines) {
+        std::cout
+        << "Line " << line.id
+        << " | Pixels: " << line.pixels.size()
+        << " | Length: " << calculate_line_length(line)
+        << " | Accuracy: " << line.accuracy
+        << " | Component: " << line.componentID
+        << '\n';
+}
+    cv::Mat debugImage = cv::Mat::zeros(
+    mergedGraph.height,
+    mergedGraph.width,
+    CV_8UC3
+);
+
+    for (const auto& line : mergedGraph.fittedLines) {
+
+        // Clear the image before drawing each function
+        debugImage.setTo(cv::Scalar(0, 0, 0));
+
+        if (line.pixels.empty())
+            continue;
+
+        // Determine the bounds of the fitted function
+        int minX = line.pixels.front().x;
+        int maxX = minX;
+
+        int minY = line.pixels.front().y;
+        int maxY = minY;
+
+        for (const auto& pixel : line.pixels) {
+            minX = std::min(minX, pixel.x);
+            maxX = std::max(maxX, pixel.x);
+
+            minY = std::min(minY, pixel.y);
+            maxY = std::max(maxY, pixel.y);
+        }
+
+        cv::Point start;
+        cv::Point end;
+
+        if (line.vertical) {
+
+            int x = static_cast<int>(
+                std::round(line.intercept)
+            );
+
+            start = cv::Point(x, minY);
+            end = cv::Point(x, maxY);
+
+        }
+        else {
+
+            start = cv::Point(
+                minX,
+                static_cast<int>(
+                    std::round(line.slope * minX + line.intercept)
+                )
+            );
+
+            end = cv::Point(
+                maxX,
+                static_cast<int>(
+                    std::round(line.slope * maxX + line.intercept)
+                )
+            );
+        }
+
+        // Draw the mathematical function
+        cv::line(
+            debugImage,
+            start,
+            end,
+            cv::Scalar(255, 255, 255),
+            1,
+            cv::LINE_8
+        );
+
+        // Mark the function endpoints
+        cv::circle(
+            debugImage,
+            start,
+            3,
+            cv::Scalar(0, 0, 255),
+            -1
+        );
+
+        cv::circle(
+            debugImage,
+            end,
+            3,
+            cv::Scalar(0, 255, 0),
+            -1
+        );
+
+        std::cout
+            << "\nDisplaying Line " << line.id
+            << " | Pixels: " << line.pixels.size()
+            << " | Accuracy: " << line.accuracy
+            << " | Start: " << start
+            << " | End: " << end
+            << '\n';
+
+        cv::imshow("Individual Fitted Function", debugImage);
+
+        // Press any key to advance to the next function
+        cv::waitKey(0);
+    }
+
+    cv::destroyWindow("Individual Fitted Function");
+    // Create image for merged results
+    cv::Mat mergedImage = cv::Mat::zeros(
+        mergedGraph.height,
+        mergedGraph.width,
+        CV_8UC3
+    );
+    for (const auto& line : mergedGraph.fittedLines) {
+
+        if (line.pixels.empty()) {
+            continue;
+        }
+
+        cv::Point start;
+        cv::Point end;
+
+        if (line.vertical) {
+
+            int minY = line.pixels.front().y;
+            int maxY = minY;
+
+            for (const auto& p : line.pixels) {
+                minY = std::min(minY, p.y);
+                maxY = std::max(maxY, p.y);
+            }
+
+            int x = static_cast<int>(std::round(line.intercept));
+
+            start = cv::Point(x, minY);
+            end = cv::Point(x, maxY);
+
+        } else {
+
+            int minX = line.pixels.front().x;
+            int maxX = minX;
+
+            for (const auto& p : line.pixels) {
+                minX = std::min(minX, p.x);
+                maxX = std::max(maxX, p.x);
+            }
+
+            start = cv::Point(
+                minX,
+                static_cast<int>(std::round(
+                    line.slope * minX + line.intercept
+                ))
+            );
+
+            end = cv::Point(
+                maxX,
+                static_cast<int>(std::round(
+                    line.slope * maxX + line.intercept
+                ))
+            );
+        }
+
+        cv::line(
+            mergedImage,
+            start,
+            end,
+            cv::Scalar(255, 255, 255),
+            1,
+            cv::LINE_8
+        );
+    }
+
+    // Display merged edge map
+    cv::imshow("Merged Edge Map", mergedImage);
+    cv::waitKey(0);
+    cv::destroyAllWindows();
+
+    return 0;
 }
 
