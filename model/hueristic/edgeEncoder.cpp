@@ -22,6 +22,7 @@
 #include <deque>
 #include <stack>
 
+
 //the intial datastructure for pixel information
 struct EdgeData {
     int id = -1;
@@ -53,6 +54,7 @@ struct funcData{
     cv::Point end;
     //list of corresponding pixels
     std::vector<cv::Point> pixels;
+    int pathID = -1;
 };
 
 //node struct for a graph tree
@@ -88,6 +90,9 @@ struct IntersectionData {
 struct bezierData {
     int id = -1;
     int edgeID = -1;
+    int pathID = -1;
+    int startLineID = -1;
+    int endLineID = -1;
 
     //control points
     cv::Point2d p0;
@@ -101,7 +106,14 @@ struct bezierData {
     std::vector<cv::Point> pixels;
 };
 
+//piecewise approx for curves
+struct piecewiseCurve {
+    int edgeID = -1;
+    int pathID = -1;
 
+    std::vector<funcData> lines;
+    std::vector<bezierData> curves;
+};
 
 
 cv::Mat sobelEdgeDetector(const std::string& path){
@@ -478,6 +490,7 @@ std::vector<funcData> drawLine(const std::vector<EdgeGraph>& graphs, const image
                             funcData function;
                             function.id = static_cast<int>(functions.size());
                             function.edgeID = graph.componentID;
+                            function.pathID = path.id;
                             function.a = lastA;
                             function.b = lastB;
                             function.c = lastC;
@@ -520,6 +533,7 @@ std::vector<funcData> drawLine(const std::vector<EdgeGraph>& graphs, const image
 
             function.id = static_cast<int>(functions.size());
             function.edgeID = graph.componentID;
+            function.pathID = path.id;
 
             function.a = lastA;
             function.b = lastB;
@@ -539,64 +553,301 @@ std::vector<funcData> drawLine(const std::vector<EdgeGraph>& graphs, const image
 }
 
 
+double checkCurveAccuracy(const bezierData& curve,double pixelTolerance){
+    if(curve.pixels.empty()){
+        return 0.0;
+    }
 
-std::vector<bezierData> createCurve(const std::vector<EdgeGraph>& graphs, const imageData& image){
+    const int samples = std::max(1000,static_cast<int>(curve.pixels.size()) * 2);
+    std::vector<cv::Point2d> curvePoints;
+    curvePoints.reserve(samples + 1);
+
+    for(int i = 0; i <= samples; i++){
+        double t = static_cast<double>(i) / samples;
+        double u = 1.0 - t;
+
+        cv::Point2d point =
+            (u * u) * curve.p0 +
+            (2.0 * u * t) * curve.p1 +
+            (t * t) * curve.p2;
+
+        curvePoints.push_back(point);
+    }
+
+    int matchedPixels = 0;
+    double toleranceSquared = pixelTolerance * pixelTolerance;
+
+    // Compare each original pixel against the curve
+    for(const cv::Point& pixel : curve.pixels){
+        cv::Point2d original(pixel.x, pixel.y);
+        double minimumDistanceSquared =
+            std::numeric_limits<double>::infinity();
+
+        for(const cv::Point2d& point : curvePoints){
+
+            cv::Point2d difference = original - point;
+            double distanceSquared =
+                difference.dot(difference);
+            minimumDistanceSquared =std::min(minimumDistanceSquared, distanceSquared);
+        }
+        if(minimumDistanceSquared <= toleranceSquared){
+            matchedPixels++;
+        }
+    }
+    return static_cast<double>(matchedPixels) /
+           curve.pixels.size();
+}
+
+
+//determine angle threshold, if we need a curve or not
+double calculateAngle(const funcData& first, const funcData& second) {
+    cv::Point2d v1 = cv::Point2d(first.end - first.start);
+    cv::Point2d v2 = cv::Point2d(second.end - second.start);
+
+    double length1 = cv::norm(v1);
+    double length2 = cv::norm(v2);
+
+    if (length1 < 1e-9 || length2 < 1e-9)
+        return 0.0;
+    //find the angle difference between two connecting functions
+    double cosine = v1.dot(v2) / (length1 * length2);
+    //if its within tolerance, we assume it can be replaced with a quadriatic
+    cosine = std::clamp(cosine, -1.0, 1.0);
+
+    return std::acos(cosine) * 180.0 / CV_PI;
+}
+
+
+
+cv::Point2d calculateControlPoint(const std::vector<cv::Point>& pixels) {
+    int n = static_cast<int>(pixels.size());
+    cv::Point2d p0 = pixels.front();
+    cv::Point2d p2 = pixels.back();
+
+    double numeratorX = 0.0;
+    double numeratorY = 0.0;
+    double denominator = 0.0;
+
+    for(int i = 0; i < n; i++) {
+        double t = static_cast<double>(i) / (n - 1);
+        double u = 1.0 - t;
+
+        double weight = 2.0 * u * t;
+        cv::Point2d expected =(u * u) * p0 + (t * t) * p2;
+        cv::Point2d difference = cv::Point2d(pixels[i]) - expected;
+
+        numeratorX += weight * difference.x;
+        numeratorY += weight * difference.y;
+        denominator += weight * weight;
+    }
+
+    if(denominator < 1e-9)
+        return (p0 + p2) * 0.5;
+
+    return cv::Point2d(numeratorX / denominator, numeratorY / denominator);
+}
+
+
+
+
+//replace linear functions with quadriatic curves
+//q(x) = ax^2 + bx + c
+std::vector<bezierData> createCurve(const std::vector<EdgeGraph>& graphs, const std::vector<funcData>& functions, const imageData& image){
     //final curves
     std::vector<bezierData> curves;
     //checks
+    const double minAngleTolerance = 2.0;
+    //a 90 degree angle shouldnt have a curve, neither should a 180degree angle
+    //we need a range
+    const double maxAngleTolerance = 80.0;
     const double accuracyThreshold = 0.75;
-    const double tolerance = 1.0;
+    const double pixelTolerance = 1.0;
+
     //iterate through the components
     for(const EdgeGraph& graph: graphs){
-        //traverse linear functions
-        for(const EdgePath& path : graph.paths){
-            //we need at least 3 pixels to fill the three weights of the bezier curve
-            if(path.nodeIDs.size() < 3){
+        //traverse connecting paths
+        for(const EdgePath& path: graph.paths){
+            //make sure there is enough pixels for a curve
+            if(path.nodeIDs.size()< 3){
                 continue;
             }
-            //potential curve
-            bezierData candidate;
-            candidate.id = static_cast<int>(curves.size());
-            candidate.edgeID = graph.componentID;
-            //first weight
-            candidate.p0 = graph.nodes[path.nodeIDs.front()].pixel;
-            //endpoint weight weight
-            candidate.p2 = graph.nodes[path.nodeIDs.back()].pixel;
-            //adjustable weight
-            candidate.p1 =(candidate.p0 + candidate.p2) * 0.5;
-            //use hillclimbing to find the maximum bend of a curve
-            cv::Point2d p0 = candidate.p0;
-            cv::Point2d p2 = candidate.p2;
-            double maxDistance = -1.0;
-            cv::Point2d crest;
+            //group functions in this path
+            std::vector<const funcData*> pathLines;
+            //iterate through individual paths
+            for(const funcData& function : functions){
+                //make sure we are checking the current function for the path and component
+                if(function.edgeID == graph.componentID && function.pathID == path.id){
+                    pathLines.push_back(&function);
+                }
+            }
+            int lineCount = static_cast<int>(pathLines.size());
+            //combine at least 2 functions, header--> sliding tail
+            if(lineCount < 2){
+                continue;
+            }
+            int head = 0;
+            //always the function inf front of the head, or merged heads
+            int tempTail = head + 1;
+            bezierData lastValidCurve;
+            bool hasValidCurve = false;
+            int lastValidTail = -1;
+            //begin merging
+            while(head < lineCount - 1){
 
-            double dx = p2.x - p0.x;
-            double dy = p2.y - p0.y;
-            double length = std::sqrt(dx * dx + dy * dy);
-            //threshold to determine if a line should be a curve
-            if(length < 1e-9){
-                continue;
-            }
-            //iterate through the connecting pixels between the current endpoints
-            for(int nodeID: path.nodeIDs){
-                cv::Point2d pixel = std::abs(dx* (pixel.y - p0.y) - dy * (pixel.x - p0.x)) / length;
-                //new hill
-                if(distance > maxDistance){
-                    maxDistance = distance;
-                    crest = pixel;
+                if(tempTail >= lineCount){
+                    if(hasValidCurve){
+                        lastValidCurve.id = static_cast<int>(curves.size());
+                        lastValidCurve.edgeID = graph.componentID;
+
+                        curves.push_back(lastValidCurve);
+
+                        head = lastValidTail + 1;
+                        hasValidCurve = false;
+                        lastValidTail = -1;
+
+                        tempTail = head + 1;
+                        continue;
+                    }
+                    break;
+                }
+
+                const funcData& previousLine = *pathLines[tempTail - 1];
+                const funcData& nextLine = *pathLines[tempTail];
+                //find current angle difference between head and tail
+                //determine if we need a curve here
+                double angle = calculateAngle(previousLine, nextLine);
+                //only potential curve within a specific range
+                //adjust min and max for specific use case
+                if(angle >= minAngleTolerance && angle<= maxAngleTolerance || hasValidCurve && angle <= maxAngleTolerance){
+                    //potential curve predicted
+                    bezierData candidate;
+                    
+                    candidate.edgeID = graph.componentID;
+                    candidate.pathID = path.id;
+                    candidate.startLineID = pathLines[head]->id;
+                    candidate.endLineID = pathLines[tempTail]->id;
+                    //add the second functions pixels
+                    for(int i = head; i <= tempTail; i++){
+                        const funcData& line = *pathLines[i];
+
+                        for(const cv::Point& pixel : line.pixels){
+                            if(candidate.pixels.empty() || pixel != candidate.pixels.back()){
+                                candidate.pixels.push_back(pixel);
+                            }
+                        }
+                    }
+                    //new endpoints
+                    candidate.p0 = candidate.pixels.front();
+                    candidate.p2 = candidate.pixels.back();
+
+                    //find the center weight for the bezier curve
+                    candidate.p1 = calculateControlPoint(candidate.pixels);
+                    candidate.accuracy = checkCurveAccuracy(candidate, pixelTolerance);
+
+                    std::cout << "Lines "
+                    << candidate.startLineID << "-"
+                    << candidate.endLineID
+                    << " | Accuracy: " << candidate.accuracy
+                    << " | Pixels: " << candidate.pixels.size()
+                    << std::endl;
+
+
+                    if(candidate.accuracy >= accuracyThreshold){
+                        //use piecewise function
+                        lastValidCurve = candidate;
+                        hasValidCurve = true;
+                        lastValidTail = tempTail;
+                        tempTail++;
+                    }
+                    else{
+                        //failed candidate
+                        if(hasValidCurve){
+                            lastValidCurve.id = static_cast<int>(curves.size());
+                            lastValidCurve.edgeID = graph.componentID;
+                            curves.push_back(lastValidCurve);
+                            head = lastValidTail + 1;
+                        }
+                        else{
+                            //move head
+                            head++;
+                        }
+                        tempTail = head + 1;
+                        //previous function failed
+                        hasValidCurve = false;
+                        lastValidTail = -1;
+                    }
 
                 }
-                candidate.pixels.push_back(graph.nodes[nodeID].pixel);
+                else{
+                    //linear function
+                    if(hasValidCurve == true){
+                        lastValidCurve.id = static_cast<int>(curves.size());
+                        lastValidCurve.edgeID = graph.componentID;
+                        curves.push_back(lastValidCurve);
+                        head = lastValidTail + 1;
+                    }
+                    else{
+                        head++;
+                    }
+                    tempTail = head + 1;
+                    hasValidCurve = false;
+                    lastValidTail = -1;
+                }
+
             }
-            //final hill
-            //quadriuatic bezier equation
-            candidate.p1 = 2.0 * crest - 0.5 * (candidate.p0 + candidate.p2);
-            //add new curve
-            curves.push_back(candidate);
+
         }
     }
     return curves;
+    }
+
+
+
+
+
+
+cv::Mat displayBezier(
+    const std::vector<bezierData>& curves,
+    const imageData& image
+){
+    cv::Mat display = cv::Mat::zeros(
+        image.height,
+        image.width,
+        CV_8UC3
+    );
+
+    for(const bezierData& curve : curves){
+
+        cv::Point previous = curve.p0;
+
+        for(int i = 1; i <= 1000; i++){
+
+            double t = static_cast<double>(i) / 1000.0;
+            double u = 1.0 - t;
+
+            cv::Point2d point =
+                (u * u) * curve.p0 +
+                (2.0 * u * t) * curve.p1 +
+                (t * t) * curve.p2;
+
+            cv::line(
+                display,
+                previous,
+                cv::Point(cvRound(point.x), cvRound(point.y)),
+                cv::Scalar(0, 255, 0),
+                1
+            );
+
+            previous = cv::Point(
+                cvRound(point.x),
+                cvRound(point.y)
+            );
+        }
+    }
+
+    return display;
 }
+
 
 
 
@@ -688,69 +939,30 @@ void displayFunctions(
 
 
 int main() {
+
     std::string path = R"(F:\CARLA set\sets\modifiedCurve.jpg)";
+
+    // 1. Generate the skeleton
     cv::Mat skeleton = sobelEdgeDetector(path);
-    std::vector<EdgeData> components = groupPixels(skeleton);
 
     std::cout << "Skeleton pixels: "
-          << cv::countNonZero(skeleton) << std::endl;
+            << cv::countNonZero(skeleton) << std::endl;
 
-    std::cout << "Total components: "
-            << components.size() << std::endl;
-
-    std::vector<EdgeGraph> graphs = map(components);
-
-    for (EdgeGraph& graph : graphs) {
-    if (graph.nodes.empty()) {
-        continue;
-    }
-    int startNode = 0;
-
-    // Prefer an endpoint
-        for (int i = 0; i < static_cast<int>(graph.nodes.size()); i++) {
-            if (graph.nodes[i].neighbors.size() == 1) {
-                startNode = i;
-                break;
-            }
-        }
-            graph.paths = findPaths(graph, startNode);
-            std::cout << "Component " << graph.componentID
-          << " | Nodes: " << graph.nodes.size()
-          << " | Paths: " << graph.paths.size()
-          << std::endl;
-
-        int endpoints = 0;
-        int junctions = 0;
-
-        for (const PixelNode& node : graph.nodes) {
-            if (node.neighbors.size() == 1) {
-                endpoints++;
-            }
-            else if (node.neighbors.size() > 2) {
-                junctions++;
-            }
-        }
-
-        std::cout << "Component " << graph.componentID
-                << " | Endpoints: " << endpoints
-                << " | Junctions: " << junctions
-                << std::endl;
+    std::cout << "Skeleton dimensions: "
+            << skeleton.cols << " x "
+            << skeleton.rows << std::endl;
 
 
-            for (const EdgePath& path : graph.paths) {
-                std::cout << "  Path " << path.id
-                        << " | Pixels: " << path.nodeIDs.size()
-                        << std::endl;
-    }
-        }
+    // 2. Group connected pixels
+    std::vector<EdgeData> components = groupPixels(skeleton);
 
-
-
+    // 3. Initialize image data
     imageData image;
+
     image.originalImage = cv::imread(path);
 
-    if (image.originalImage.empty()) {
-        std::cerr << "Failed to load image: " << path << std::endl;
+    if(image.originalImage.empty()){
+        std::cerr << "Failed to load image!" << std::endl;
         return 1;
     }
 
@@ -758,21 +970,54 @@ int main() {
     image.height = image.originalImage.rows;
     image.skeleton = skeleton;
 
-    std::vector<funcData> functions = drawLine(graphs, image);
+    // 4. Convert components into graphs
+    std::vector<EdgeGraph> graphs = map(components);
 
-    std::cout << "\nTotal linear functions: "
-            << functions.size() << std::endl;
+    // 5. Find paths within each graph
+    for(EdgeGraph& graph : graphs){
 
-    for (const funcData& function : functions) {
-        std::cout << "Function " << function.id
-                << " | Pixels: " << function.pixels.size()
-                << " | Accuracy: " << function.accuracy
-                << std::endl;
+        if(graph.nodes.empty()){
+            continue;
+        }
+
+        graph.paths = findPaths(graph, 0);
     }
 
+    // 6. Fit linear functions
+    std::vector<funcData> functions = drawLine(graphs, image);
+
+    // 7. Fit quadratic Bézier curves
+    std::vector<bezierData> curves =
+        createCurve(graphs, functions, image);
+
+    // 8. Display results
+    std::cout << "\nOriginal linear functions: "
+              << functions.size() << std::endl;
+
+    std::cout << "Accepted Bezier curves: "
+              << curves.size() << std::endl;
+
+    for(const bezierData& curve : curves){
+
+        std::cout << "Curve " << curve.id
+                  << " | Component: " << curve.edgeID
+                  << " | Path: " << curve.pathID
+                  << " | Replaces lines: "
+                  << curve.startLineID << " - "
+                  << curve.endLineID
+                  << " | Pixels: " << curve.pixels.size()
+                  << " | Accuracy: " << curve.accuracy
+                  << std::endl;
+    }
+
+    // 9. Display skeleton
     cv::imshow("Skeleton", skeleton);
-    displayFunctions(functions, image);
+    cv::Mat bezierDisplay = displayBezier(curves, image);
+
+    cv::imshow("Bezier Curves", bezierDisplay);
 
     cv::waitKey(0);
     cv::destroyAllWindows();
+
+    return 0;
 }
