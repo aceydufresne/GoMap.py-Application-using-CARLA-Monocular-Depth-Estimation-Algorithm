@@ -540,9 +540,63 @@ std::vector<funcData> drawLine(const std::vector<EdgeGraph>& graphs, const image
 
 
 
-//std::vector<bezierData> createCurve(const std::vector<EdgeGraph>& graphs, const imageData& image){
+std::vector<bezierData> createCurve(const std::vector<EdgeGraph>& graphs, const imageData& image){
+    //final curves
+    std::vector<bezierData> curves;
+    //checks
+    const double accuracyThreshold = 0.75;
+    const double tolerance = 1.0;
+    //iterate through the components
+    for(const EdgeGraph& graph: graphs){
+        //traverse linear functions
+        for(const EdgePath& path : graph.paths){
+            //we need at least 3 pixels to fill the three weights of the bezier curve
+            if(path.nodeIDs.size() < 3){
+                continue;
+            }
+            //potential curve
+            bezierData candidate;
+            candidate.id = static_cast<int>(curves.size());
+            candidate.edgeID = graph.componentID;
+            //first weight
+            candidate.p0 = graph.nodes[path.nodeIDs.front()].pixel;
+            //endpoint weight weight
+            candidate.p2 = graph.nodes[path.nodeIDs.back()].pixel;
+            //adjustable weight
+            candidate.p1 =(candidate.p0 + candidate.p2) * 0.5;
+            //use hillclimbing to find the maximum bend of a curve
+            cv::Point2d p0 = candidate.p0;
+            cv::Point2d p2 = candidate.p2;
+            double maxDistance = -1.0;
+            cv::Point2d crest;
 
-//}
+            double dx = p2.x - p0.x;
+            double dy = p2.y - p0.y;
+            double length = std::sqrt(dx * dx + dy * dy);
+            //threshold to determine if a line should be a curve
+            if(length < 1e-9){
+                continue;
+            }
+            //iterate through the connecting pixels between the current endpoints
+            for(int nodeID: path.nodeIDs){
+                cv::Point2d pixel = std::abs(dx* (pixel.y - p0.y) - dy * (pixel.x - p0.x)) / length;
+                //new hill
+                if(distance > maxDistance){
+                    maxDistance = distance;
+                    crest = pixel;
+
+                }
+                candidate.pixels.push_back(graph.nodes[nodeID].pixel);
+            }
+            //final hill
+            //quadriuatic bezier equation
+            candidate.p1 = 2.0 * crest - 0.5 * (candidate.p0 + candidate.p2);
+            //add new curve
+            curves.push_back(candidate);
+        }
+    }
+    return curves;
+}
 
 
 
