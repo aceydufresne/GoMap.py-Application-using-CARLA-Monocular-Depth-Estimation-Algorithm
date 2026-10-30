@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <deque>
 #include <stack>
+#include <variant>
 
 
 //the intial datastructure for pixel information
@@ -107,12 +108,11 @@ struct bezierData {
 };
 
 //piecewise approx for curves
-struct piecewiseCurve {
+struct piecewiseData {
     int edgeID = -1;
     int pathID = -1;
 
-    std::vector<funcData> lines;
-    std::vector<bezierData> curves;
+    std::vector<std::variant<funcData, bezierData>> segments;
 };
 
 
@@ -802,6 +802,58 @@ std::vector<bezierData> createCurve(const std::vector<EdgeGraph>& graphs, const 
     }
 
 
+
+//reduce quadriatic and linear functions by merging them together into a piecewise function
+std::vector<piecewiseData> reduceEdges(const std::vector<EdgeGraph>& graphs, const std::vector<funcData>& functions, const std::vector<bezierData>& curves){
+    std::vector<piecewiseData>result;
+    //traverse through components
+    for(const EdgeGraph& graph: graphs){
+        //iterate through paths
+        for(const EdgePath& path: graph.paths){
+            piecewiseData piecewise;
+            piecewise.edgeID = graph.componentID;
+            piecewise.pathID = path.id;
+            //group linear functions from the path
+            std::vector<const funcData*> pathLines;
+            //iterate through each function in a path
+            for(const funcData& function: functions){
+                if(function.edgeID == graph.componentID && function.pathID == path.id){
+                    pathLines.push_back(&function);
+                }
+            }
+            //ordered functions
+            int i = 0;
+            while(i<static_cast<int>(pathLines.size())){
+                const funcData& currentLine = *pathLines[i];
+                //check bezier connects
+                const bezierData* matchingCurve = nullptr;
+                //check the bezier curves
+                for(const bezierData& curve: curves){
+                    if(curve.edgeID == graph.componentID && curve.pathID == path.id && curve.startLineID == currentLine.id){
+                        matchingCurve = &curve;
+                        break;
+                    }
+                }
+                if(matchingCurve != nullptr){
+                    //if the bezier starts at the end of the linear function, use the bezier approximation rather than the linear function
+                    piecewise.segments.push_back(*matchingCurve);
+
+                    while(i < static_cast<int>(pathLines.size()) && pathLines[i]->id <= matchingCurve->endLineID){
+                        i++;
+                    }
+                }
+                else{
+                    piecewise.segments.push_back(currentLine);
+                    i++;
+                }
+            }
+            if(!piecewise.segments.empty()){
+                result.push_back(std::move(piecewise));
+            }
+        }
+    }
+    return result;
+}
 
 
 
