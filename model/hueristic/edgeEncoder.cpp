@@ -856,6 +856,59 @@ std::vector<piecewiseData> reduceEdges(const std::vector<EdgeGraph>& graphs, con
 }
 
 
+std::vector<piecewise> createQuadriatic(const std::vector<EdgeGraph>& graphs, const std::vector<funcData>& functions, const std::vector<bezierData>& curves){
+    //boolean to check whether two functions should be reduced in the piecewise function
+    std::vector<piecewise> quadratic;
+    bool isValid = false;
+    functionLength = static_cast<int>functions.size();
+    double accuracyThresh = .75;
+    
+    //iterate through components
+    for(const EdgeGraph& graph : graphs){
+        //traverse paths
+        for(const EdgePath& path: paths){
+            int head = 0;
+            int tail = head + 1;
+            //through individual functions
+            bezierData candidate;
+            for(i = 0; i < functioLength; i++){
+                const funcData& headPointer = functions[head];
+                const funcData& tailPointer = functions[tail];
+                //checkCurveAccuracy if both functions are beziers
+                //holds_alternative returns true if function is linear
+                if(!std::hold_alternative<funData>headPointer &&!std::hold_alternative<funData>tailPointer){
+                    std::vector<cv::Point> combinedPixels = headPointer.pixels;
+                    //head is empty skip this function
+                    if(headPointer.empty()){
+                        head++;
+                        tail++;
+                        continue;
+                    }
+                    //tail is empty
+                    else if(tailPointer.empty()){
+                        head++;
+                        tail++;
+                        continue;
+                    }
+                    //combine lists into 1 ordered list
+                    else{
+                        for(const cv::Point& pixel: tailPointer.pixels){
+                            //add pixels from the tail pointer
+                            combinedPixels.push_back(pixel);
+                        }
+                        //create a new candidate function
+                        candidate.pixels = std::move(combinedPixels);
+                        candidate.p0 = candidate.pixels.front();
+                        candidate.p2 = candidate.pixels.back();
+                    }
+                }
+
+            }
+        }
+    }
+}
+
+
 
 
 cv::Mat displayBezier(
@@ -987,6 +1040,119 @@ void displayFunctions(
 
 
 
+cv::Mat displayPiecewise(
+    const std::vector<piecewiseData>& piecewise,
+    const imageData& image
+){
+    cv::Mat display = cv::Mat::zeros(
+        image.height,
+        image.width,
+        CV_8UC3
+    );
+
+    for(const piecewiseData& path : piecewise){
+
+        for(const auto& segment : path.segments){
+
+            if(std::holds_alternative<funcData>(segment)){
+
+                const funcData& line =
+                    std::get<funcData>(segment);
+
+                // Project endpoints onto fitted line
+                double denominator =
+                    line.a * line.a + line.b * line.b;
+
+                if(denominator < 1e-12){
+                    continue;
+                }
+
+                auto project = [&](const cv::Point2d& p){
+                    double distance =
+                        (line.a * p.x +
+                         line.b * p.y +
+                         line.c) / denominator;
+
+                    return cv::Point2d(
+                        p.x - line.a * distance,
+                        p.y - line.b * distance
+                    );
+                };
+
+                cv::Point2d start = project(line.start);
+                cv::Point2d end = project(line.end);
+
+                // Blue linear segment
+                cv::line(
+                    display,
+                    start,
+                    end,
+                    cv::Scalar(255, 0, 0),
+                    2,
+                    cv::LINE_AA
+                );
+
+                // Red endpoints
+                cv::circle(display, start, 3,
+                           cv::Scalar(0, 0, 255), -1);
+                cv::circle(display, end, 3,
+                           cv::Scalar(0, 0, 255), -1);
+            }
+            else{
+
+                const bezierData& curve =
+                    std::get<bezierData>(segment);
+
+                cv::Point previous(
+                    cvRound(curve.p0.x),
+                    cvRound(curve.p0.y)
+                );
+
+                // Draw quadratic Bezier
+                for(int i = 1; i <= 1000; i++){
+
+                    double t = static_cast<double>(i) / 1000.0;
+                    double u = 1.0 - t;
+
+                    cv::Point2d point =
+                        (u * u) * curve.p0 +
+                        (2.0 * u * t) * curve.p1 +
+                        (t * t) * curve.p2;
+
+                    cv::Point current(
+                        cvRound(point.x),
+                        cvRound(point.y)
+                    );
+
+                    // Green Bezier segment
+                    cv::line(
+                        display,
+                        previous,
+                        current,
+                        cv::Scalar(0, 255, 0),
+                        2,
+                        cv::LINE_AA
+                    );
+
+                    previous = current;
+                }
+
+                // Red endpoints
+                cv::circle(display, curve.p0, 3,
+                           cv::Scalar(0, 0, 255), -1);
+                cv::circle(display, curve.p2, 3,
+                           cv::Scalar(0, 0, 255), -1);
+            }
+        }
+    }
+
+    return display;
+}
+
+
+
+
+
 
 
 
@@ -1061,6 +1227,57 @@ int main() {
                   << " | Accuracy: " << curve.accuracy
                   << std::endl;
     }
+
+
+// 8. Combine linear functions and Bezier curves
+    std::vector<piecewiseData> piecewise =
+        reduceEdges(graphs, functions, curves);
+
+    // 9. Display piecewise statistics
+    int totalLinear = 0;
+    int totalBezier = 0;
+
+    for(const piecewiseData& path : piecewise){
+        std::cout << "\nComponent: " << path.edgeID
+                << " | Path: " << path.pathID
+                << " | Segments: " << path.segments.size()
+                << std::endl;
+
+        for(const auto& segment : path.segments){
+            if(std::holds_alternative<funcData>(segment)){
+                const funcData& line = std::get<funcData>(segment);
+
+                totalLinear++;
+
+                std::cout << "  Linear: " << line.id
+                        << " | Accuracy: " << line.accuracy
+                        << std::endl;
+            }
+            else{
+                const bezierData& curve = std::get<bezierData>(segment);
+
+                totalBezier++;
+
+                std::cout << "  Bezier: " << curve.id
+                        << " | Replaces: "
+                        << curve.startLineID << "-"
+                        << curve.endLineID
+                        << " | Accuracy: " << curve.accuracy
+                        << std::endl;
+            }
+        }
+    }
+
+    std::cout << "\nFinal piecewise results:\n"
+            << "Linear segments: " << totalLinear << "\n"
+            << "Bezier segments: " << totalBezier << "\n"
+            << "Total segments: " << totalLinear + totalBezier
+            << std::endl;
+
+    cv::Mat piecewiseDisplay = displayPiecewise(piecewise, image);
+
+    cv::imshow("Piecewise Functions", piecewiseDisplay);
+
 
     // 9. Display skeleton
     cv::imshow("Skeleton", skeleton);
