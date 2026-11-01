@@ -24,6 +24,18 @@
 #include <variant>
 
 
+struct metaData {
+    int componentCount = 0;
+    int endPointData = 0;
+    int junctionData = 0;
+    int closedLoopCount = 0;
+
+    double normalizedContourLength = 0.0;
+    double normalizedEnclosedArea = 0.0;
+};
+
+
+
 //the intial datastructure for pixel information
 struct EdgeData {
     int id = -1;
@@ -142,11 +154,11 @@ cv::Mat sobelEdgeDetector(const std::string& path){
     //skeletolize the graph
     cv::Mat binaryMap;
     cv::threshold(
-        image,
+        edgeMap,
         binaryMap,
-        200,
+        50,
         255,
-        cv::THRESH_BINARY_INV
+        cv::THRESH_BINARY
     );
 
     cv::Mat skeleton;
@@ -165,6 +177,7 @@ cv::Mat sobelEdgeDetector(const std::string& path){
 std::vector<EdgeData> groupPixels(const cv::Mat& skeleton){
     std::vector<EdgeData> components;
     int componentID = 0;
+    //connectedComponentCount = 0;
 
     if(skeleton.empty() || skeleton.type() != CV_8UC1){
         return components;
@@ -227,6 +240,8 @@ std::vector<EdgeData> groupPixels(const cv::Mat& skeleton){
         components.push_back(std::move(data));
         }
     }
+    //for normalizing data in the dataset
+    //connectedComponentCount = static_cast<int>(components.size());
     return components;
 }
 
@@ -855,435 +870,211 @@ std::vector<piecewiseData> reduceEdges(const std::vector<EdgeGraph>& graphs, con
     return result;
 }
 
-
-std::vector<piecewise> createQuadriatic(const std::vector<EdgeGraph>& graphs, const std::vector<funcData>& functions, const std::vector<bezierData>& curves){
+//piecewise function representation
+//not currently in use
+//std::vector<piecewise> createQuadriatic(const std::vector<EdgeGraph>& graphs, const std::vector<funcData>& functions, const std::vector<bezierData>& curves){
     //boolean to check whether two functions should be reduced in the piecewise function
-    std::vector<piecewise> quadratic;
-    bool isValid = false;
-    functionLength = static_cast<int>functions.size();
-    double accuracyThresh = .75;
+  //  std::vector<piecewise> quadratic;
+    //bool isValid = false;
+    //functionLength = static_cast<int>functions.size();
+    //double accuracyThresh = .75;
     
     //iterate through components
-    for(const EdgeGraph& graph : graphs){
+    //for(const EdgeGraph& graph : graphs){
         //traverse paths
-        for(const EdgePath& path: paths){
-            int head = 0;
-            int tail = head + 1;
+        //for(const EdgePath& path: paths){
+            //int head = 0;
+            //int tail = head + 1;
             //through individual functions
-            bezierData candidate;
-            for(i = 0; i < functioLength; i++){
-                const funcData& headPointer = functions[head];
-                const funcData& tailPointer = functions[tail];
+            //bezierData candidate;
+            //for(i = 0; i < functioLength; i++){
+                //const funcData& headPointer = functions[head];
+                //const funcData& tailPointer = functions[tail];
                 //checkCurveAccuracy if both functions are beziers
                 //holds_alternative returns true if function is linear
-                if(!std::hold_alternative<funData>headPointer &&!std::hold_alternative<funData>tailPointer){
-                    std::vector<cv::Point> combinedPixels = headPointer.pixels;
-                    //head is empty skip this function
-                    if(headPointer.empty()){
-                        head++;
-                        tail++;
-                        continue;
-                    }
-                    //tail is empty
-                    else if(tailPointer.empty()){
-                        head++;
-                        tail++;
-                        continue;
-                    }
-                    //combine lists into 1 ordered list
-                    else{
-                        for(const cv::Point& pixel: tailPointer.pixels){
-                            //add pixels from the tail pointer
-                            combinedPixels.push_back(pixel);
-                        }
-                        //create a new candidate function
-                        candidate.pixels = std::move(combinedPixels);
-                        candidate.p0 = candidate.pixels.front();
-                        candidate.p2 = candidate.pixels.back();
-                    }
-                }
+                //if(std::hold_alternative<funData>headPointer || std::hold_alternative<funData>tailPointer){
+                    //std::vector<cv::Point> combinedPixels = headPointer.pixels;
+                    //their intersections do not match
+                    //if(tailPointer != headPointer){
+                        //continue;
+                    //}
+                    //else{
 
+                    //}
+                //}
+            //}
+        //}
+    //}
+    //return quadratic;
+//}
+
+
+int countCycles(const std::vector<EdgeGraph>& graphs) {
+    int totalCycles = 0;
+
+    for (const EdgeGraph& graph : graphs) {
+        int vertices = static_cast<int>(graph.nodes.size());
+
+        int totalDegrees = 0;
+
+        for (const PixelNode& node : graph.nodes) {
+            totalDegrees += static_cast<int>(node.neighbors.size());
+        }
+
+        // Each undirected edge is counted twice
+        int edges = totalDegrees / 2;
+
+        if (vertices > 0) {
+            totalCycles += edges - vertices + 1;
+        }
+    }
+
+    return totalCycles;
+}
+
+
+
+
+
+
+//gather meta data infor
+metaData getData(const std::vector<EdgeGraph>& graphs, const imageData& image) {
+    metaData data;
+    //number of connected components
+    data.componentCount = static_cast<int>(graphs.size());
+
+    double totalLength = 0.0;
+    double totalArea = 0.0;
+
+    //traverse components
+    for (const EdgeGraph& graph : graphs) {
+        //traverse nodes
+        for (const PixelNode& node : graph.nodes) {
+
+            int degree = static_cast<int>(node.neighbors.size());
+            if (degree == 1) {
+                data.endPointData++;
+            }
+            else if (degree >= 3) {
+                data.junctionData++;
             }
         }
-    }
-}
+        //iterate through paths to find length of paths + total length of directional map
+        for (const EdgePath& path : graph.paths) {
+            if (path.nodeIDs.size() < 2)
+                continue;
+            std::vector<cv::Point> contour;
 
+            for (int nodeID : path.nodeIDs) {
+                contour.push_back(graph.nodes[nodeID].pixel);
+            }
+            //calculate total contour length
+            totalLength += cv::arcLength(contour, false);
 
+            //calculate closed-loop area
+            if (path.closed && contour.size() >= 3) {
+                data.closedLoopCount++;
 
-
-cv::Mat displayBezier(
-    const std::vector<bezierData>& curves,
-    const imageData& image
-){
-    cv::Mat display = cv::Mat::zeros(
-        image.height,
-        image.width,
-        CV_8UC3
-    );
-
-    for(const bezierData& curve : curves){
-
-        cv::Point previous = curve.p0;
-
-        for(int i = 1; i <= 1000; i++){
-
-            double t = static_cast<double>(i) / 1000.0;
-            double u = 1.0 - t;
-
-            cv::Point2d point =
-                (u * u) * curve.p0 +
-                (2.0 * u * t) * curve.p1 +
-                (t * t) * curve.p2;
-
-            cv::line(
-                display,
-                previous,
-                cv::Point(cvRound(point.x), cvRound(point.y)),
-                cv::Scalar(0, 255, 0),
-                1
-            );
-
-            previous = cv::Point(
-                cvRound(point.x),
-                cvRound(point.y)
-            );
-        }
-    }
-
-    return display;
-}
-
-
-
-
-
-
-void displayFunctions(
-    const std::vector<funcData>& functions,
-    const imageData& image
-) {
-    // Create a black canvas
-    cv::Mat display = cv::Mat::zeros(
-        image.height,
-        image.width,
-        CV_8UC3
-    );
-
-    cv::RNG rng(12345);
-
-    for (const funcData& function : functions) {
-
-        // Assign a different color to each function
-        cv::Scalar color(
-            rng.uniform(80, 256),
-            rng.uniform(80, 256),
-            rng.uniform(80, 256)
-        );
-
-        // Draw the fitted line segment
-        cv::Point2d start = function.start;
-        cv::Point2d end = function.end;
-
-        // Project each endpoint onto the fitted line
-        double denominator =
-            function.a * function.a +
-            function.b * function.b;
-
-        if (denominator < 1e-12) {
-            continue;
-        }
-
-        auto project = [&](const cv::Point2d& p) {
-            double distance =
-                (function.a * p.x +
-                function.b * p.y +
-                function.c) / denominator;
-
-            return cv::Point2d(
-                p.x - function.a * distance,
-                p.y - function.b * distance
-            );
-        };
-
-        cv::Point2d fittedStart = project(start);
-        cv::Point2d fittedEnd = project(end);
-
-        cv::line(
-            display,
-            fittedStart,
-            fittedEnd,
-            color,
-            2,
-            cv::LINE_AA
-        );
-
-        // Label the function
-        cv::Point midpoint(
-            (function.start.x + function.end.x) / 2,
-            (function.start.y + function.end.y) / 2
-        );
-
-        cv::putText(
-            display,
-            std::to_string(function.id),
-            midpoint,
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.4,
-            color,
-            1,
-            cv::LINE_AA
-        );
-    }
-    cv::imshow("Fitted Functions", display);
-}
-
-
-
-
-cv::Mat displayPiecewise(
-    const std::vector<piecewiseData>& piecewise,
-    const imageData& image
-){
-    cv::Mat display = cv::Mat::zeros(
-        image.height,
-        image.width,
-        CV_8UC3
-    );
-
-    for(const piecewiseData& path : piecewise){
-
-        for(const auto& segment : path.segments){
-
-            if(std::holds_alternative<funcData>(segment)){
-
-                const funcData& line =
-                    std::get<funcData>(segment);
-
-                // Project endpoints onto fitted line
-                double denominator =
-                    line.a * line.a + line.b * line.b;
-
-                if(denominator < 1e-12){
-                    continue;
-                }
-
-                auto project = [&](const cv::Point2d& p){
-                    double distance =
-                        (line.a * p.x +
-                         line.b * p.y +
-                         line.c) / denominator;
-
-                    return cv::Point2d(
-                        p.x - line.a * distance,
-                        p.y - line.b * distance
-                    );
-                };
-
-                cv::Point2d start = project(line.start);
-                cv::Point2d end = project(line.end);
-
-                // Blue linear segment
-                cv::line(
-                    display,
-                    start,
-                    end,
-                    cv::Scalar(255, 0, 0),
-                    2,
-                    cv::LINE_AA
+                totalArea += std::abs(
+                    cv::contourArea(contour)
                 );
-
-                // Red endpoints
-                cv::circle(display, start, 3,
-                           cv::Scalar(0, 0, 255), -1);
-                cv::circle(display, end, 3,
-                           cv::Scalar(0, 0, 255), -1);
-            }
-            else{
-
-                const bezierData& curve =
-                    std::get<bezierData>(segment);
-
-                cv::Point previous(
-                    cvRound(curve.p0.x),
-                    cvRound(curve.p0.y)
-                );
-
-                // Draw quadratic Bezier
-                for(int i = 1; i <= 1000; i++){
-
-                    double t = static_cast<double>(i) / 1000.0;
-                    double u = 1.0 - t;
-
-                    cv::Point2d point =
-                        (u * u) * curve.p0 +
-                        (2.0 * u * t) * curve.p1 +
-                        (t * t) * curve.p2;
-
-                    cv::Point current(
-                        cvRound(point.x),
-                        cvRound(point.y)
-                    );
-
-                    // Green Bezier segment
-                    cv::line(
-                        display,
-                        previous,
-                        current,
-                        cv::Scalar(0, 255, 0),
-                        2,
-                        cv::LINE_AA
-                    );
-
-                    previous = current;
-                }
-
-                // Red endpoints
-                cv::circle(display, curve.p0, 3,
-                           cv::Scalar(0, 0, 255), -1);
-                cv::circle(display, curve.p2, 3,
-                           cv::Scalar(0, 0, 255), -1);
             }
         }
     }
 
-    return display;
+    // Normalize measurements
+    double diagonal = std::hypot(image.width, image.height);
+    double imageArea = static_cast<double>(image.width) * image.height;
+
+    if (diagonal > 0.0)
+        data.normalizedContourLength = totalLength / diagonal;
+
+    if (imageArea > 0.0)
+        data.normalizedEnclosedArea = totalArea / imageArea;
+
+    return data;
 }
-
-
-
-
-
 
 
 
 int main() {
+    std::string path = R"(F:\CARLA set\renders\sketchfab\3bc5ee3b61494924b73bbeec020f3277\002.png)";
 
-    std::string path = R"(F:\CARLA set\sets\modifiedCurve.jpg)";
-
-    // 1. Generate the skeleton
-    cv::Mat skeleton = sobelEdgeDetector(path);
-
-    std::cout << "Skeleton pixels: "
-            << cv::countNonZero(skeleton) << std::endl;
-
-    std::cout << "Skeleton dimensions: "
-            << skeleton.cols << " x "
-            << skeleton.rows << std::endl;
-
-
-    // 2. Group connected pixels
-    std::vector<EdgeData> components = groupPixels(skeleton);
-
-    // 3. Initialize image data
+    // 1. Load image
     imageData image;
-
     image.originalImage = cv::imread(path);
 
-    if(image.originalImage.empty()){
-        std::cerr << "Failed to load image!" << std::endl;
+    if (image.originalImage.empty()) {
+        std::cerr << "Failed to load image!\n";
         return 1;
     }
 
     image.width = image.originalImage.cols;
     image.height = image.originalImage.rows;
-    image.skeleton = skeleton;
+
+    // 2. Sobel detection and skeletonization
+    image.skeleton = sobelEdgeDetector(path);
+
+    if (image.skeleton.empty()) {
+        std::cerr << "Failed to generate skeleton!\n";
+        return 1;
+    }
+
+    // 3. Group connected components
+    std::vector<EdgeData> components = groupPixels(image.skeleton);
 
     // 4. Convert components into graphs
     std::vector<EdgeGraph> graphs = map(components);
 
-    // 5. Find paths within each graph
-    for(EdgeGraph& graph : graphs){
-
-        if(graph.nodes.empty()){
+    // 5. Find ordered paths
+    for (EdgeGraph& graph : graphs) {
+        if (graph.nodes.empty())
             continue;
+
+        int startNode = 0;
+
+        // Prefer an endpoint
+        for (int i = 0; i < static_cast<int>(graph.nodes.size()); i++) {
+            if (graph.nodes[i].neighbors.size() == 1) {
+                startNode = i;
+                break;
+            }
         }
 
-        graph.paths = findPaths(graph, 0);
+        graph.paths = findPaths(graph, startNode);
     }
 
     // 6. Fit linear functions
     std::vector<funcData> functions = drawLine(graphs, image);
 
-    // 7. Fit quadratic Bézier curves
-    std::vector<bezierData> curves =
-        createCurve(graphs, functions, image);
+    // 7. Fit quadratic Bezier curves
+    std::vector<bezierData> curves = createCurve(graphs, functions, image);
 
-    // 8. Display results
-    std::cout << "\nOriginal linear functions: "
-              << functions.size() << std::endl;
-
-    std::cout << "Accepted Bezier curves: "
-              << curves.size() << std::endl;
-
-    for(const bezierData& curve : curves){
-
-        std::cout << "Curve " << curve.id
-                  << " | Component: " << curve.edgeID
-                  << " | Path: " << curve.pathID
-                  << " | Replaces lines: "
-                  << curve.startLineID << " - "
-                  << curve.endLineID
-                  << " | Pixels: " << curve.pixels.size()
-                  << " | Accuracy: " << curve.accuracy
-                  << std::endl;
-    }
-
-
-// 8. Combine linear functions and Bezier curves
-    std::vector<piecewiseData> piecewise =
+    // 8. Reduce into piecewise functions
+    std::vector<piecewiseData> reduced =
         reduceEdges(graphs, functions, curves);
 
-    // 9. Display piecewise statistics
-    int totalLinear = 0;
-    int totalBezier = 0;
+    // 9. Extract metadata
+    metaData data = getData(graphs, image);
 
-    for(const piecewiseData& path : piecewise){
-        std::cout << "\nComponent: " << path.edgeID
-                << " | Path: " << path.pathID
-                << " | Segments: " << path.segments.size()
-                << std::endl;
+    // 10. Print results
+    std::cout << "\n--- Pipeline Results ---\n";
+    std::cout << "Components: " << data.componentCount << '\n';
+    std::cout << "Endpoints: " << data.endPointData << '\n';
+    std::cout << "Junctions: " << data.junctionData << '\n';
+    std::cout << "Closed loops: " << data.closedLoopCount << '\n';
+    std::cout << "Normalized contour length: "
+              << data.normalizedContourLength << '\n';
+    std::cout << "Normalized enclosed area: "
+              << data.normalizedEnclosedArea << '\n';
 
-        for(const auto& segment : path.segments){
-            if(std::holds_alternative<funcData>(segment)){
-                const funcData& line = std::get<funcData>(segment);
+    std::cout << "Linear functions: " << functions.size() << '\n';
+    std::cout << "Bezier curves: " << curves.size() << '\n';
+    std::cout << "Piecewise paths: " << reduced.size() << '\n';
 
-                totalLinear++;
-
-                std::cout << "  Linear: " << line.id
-                        << " | Accuracy: " << line.accuracy
-                        << std::endl;
-            }
-            else{
-                const bezierData& curve = std::get<bezierData>(segment);
-
-                totalBezier++;
-
-                std::cout << "  Bezier: " << curve.id
-                        << " | Replaces: "
-                        << curve.startLineID << "-"
-                        << curve.endLineID
-                        << " | Accuracy: " << curve.accuracy
-                        << std::endl;
-            }
-        }
-    }
-
-    std::cout << "\nFinal piecewise results:\n"
-            << "Linear segments: " << totalLinear << "\n"
-            << "Bezier segments: " << totalBezier << "\n"
-            << "Total segments: " << totalLinear + totalBezier
-            << std::endl;
-
-    cv::Mat piecewiseDisplay = displayPiecewise(piecewise, image);
-
-    cv::imshow("Piecewise Functions", piecewiseDisplay);
-
-
-    // 9. Display skeleton
-    cv::imshow("Skeleton", skeleton);
-    cv::Mat bezierDisplay = displayBezier(curves, image);
-
-    cv::imshow("Bezier Curves", bezierDisplay);
+    // 11. Display images
+    cv::imshow("Original Image", image.originalImage);
+    cv::imshow("Skeleton", image.skeleton);
 
     cv::waitKey(0);
     cv::destroyAllWindows();
