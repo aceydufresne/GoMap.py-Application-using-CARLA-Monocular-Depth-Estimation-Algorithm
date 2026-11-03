@@ -23,6 +23,13 @@
 #include <stack>
 #include <variant>
 
+#include <filesystem>
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <stdexcept>
+
+using json = nlohmann::json;
+
 
 struct metaData {
     int componentCount = 0;
@@ -118,6 +125,18 @@ struct bezierData {
     //original list
     std::vector<cv::Point> pixels;
 };
+
+
+struct silhouette{
+    //outer functions that define the shape of the object
+    int id;
+    std::vector<funcData> outerLines;
+    std::vector<bezierData> outerCurves;
+    //coordinates that belong to each
+    std::vector<cv::Point> pixels;
+};
+
+
 
 //piecewise approx for curves
 struct piecewiseData {
@@ -992,92 +1011,408 @@ metaData getData(const std::vector<EdgeGraph>& graphs, const imageData& image) {
     if (imageArea > 0.0)
         data.normalizedEnclosedArea = totalArea / imageArea;
 
+    //how getPath is organized, does return the correct number of loops
+    data.closedLoopCount = countCycles(graphs);
+
     return data;
 }
 
 
 
-int main() {
-    std::string path = R"(F:\CARLA set\renders\sketchfab\3bc5ee3b61494924b73bbeec020f3277\002.png)";
-
-    // 1. Load image
-    imageData image;
-    image.originalImage = cv::imread(path);
-
-    if (image.originalImage.empty()) {
-        std::cerr << "Failed to load image!\n";
-        return 1;
+std::vector<silhouette> getOutline(    const std::vector<EdgeGraph>& graphs, const std::vector<funcData>& functions, const std::vector<bezierData>& curves, const imageData& image){
+    
+    std::vector<silhouette> result;
+    cv::Mat edgeMap = cv::Mat::zeros( image.height, image.width, CV_8UC1);
+    //rebuild edge map based on the node structure of the graph struct
+    for (const EdgeGraph& graph : graphs) {
+        for (const PixelNode& node : graph.nodes) {
+            if (node.pixel.x >= 0 && node.pixel.x < image.width && node.pixel.y >= 0 && node.pixel.y < image.height) {
+                edgeMap.at<uchar>(node.pixel.y, node.pixel.x) = 255;
+            }
+        }
     }
 
-    image.width = image.originalImage.cols;
-    image.height = image.originalImage.rows;
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(edgeMap, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
 
-    // 2. Sobel detection and skeletonization
-    image.skeleton = sobelEdgeDetector(path);
-
-    if (image.skeleton.empty()) {
-        std::cerr << "Failed to generate skeleton!\n";
-        return 1;
+    if (contours.empty()) {
+        return result;
+    }
+    int largestIndex = -1;
+    double largestArea = 0.0;
+    //use the contour to find the empty space of the line, which can be used to calculate the silhouette
+    for (int i = 0; i < static_cast<int>(contours.size()); i++) {
+        double area = std::abs(cv::contourArea(contours[i]));
+        if (area > largestArea) {
+            largestArea = area;
+            largestIndex = i;
+        }
+    }
+    if (largestIndex == -1) {
+        return result;
     }
 
-    // 3. Group connected components
-    std::vector<EdgeData> components = groupPixels(image.skeleton);
+    silhouette outline;
+    outline.id = 0;
+    outline.pixels = contours[largestIndex];
+    //create a mask for the contour, this will be the outline reference to build the silhouette
+    cv::Mat contourMask = cv::Mat::zeros(edgeMap.size(), CV_8UC1);
 
-    // 4. Convert components into graphs
-    std::vector<EdgeGraph> graphs = map(components);
+    for (const cv::Point& pixel : outline.pixels) {
+        contourMask.at<uchar>(pixel.y, pixel.x) = 255;
+    }
+    //result.push_back(std::move(outline));
 
-    // 5. Find ordered paths
-    for (EdgeGraph& graph : graphs) {
-        if (graph.nodes.empty())
-            continue;
+    double threshold = 0.75;
+    //traverse the paths we have collected to match to the contour
+    for (const EdgeGraph& graph : graphs) {
+        for (const EdgePath& path : graph.paths) {
 
-        int startNode = 0;
+            int matchingPixels = 0;
+            int totalPixels = 0;
 
-        // Prefer an endpoint
-        for (int i = 0; i < static_cast<int>(graph.nodes.size()); i++) {
-            if (graph.nodes[i].neighbors.size() == 1) {
-                startNode = i;
-                break;
+            for (int nodeID : path.nodeIDs) {
+                const PixelNode& node = graph.nodes[nodeID];
+                totalPixels++;
+
+                if (contourMask.at<uchar>(node.pixel.y, node.pixel.x) == 255) {
+                    matchingPixels++;
+                }
+            }
+
+            if (totalPixels == 0) {
+                continue;
+            }
+            double accuracy = static_cast<double>(matchingPixels) / totalPixels;
+
+            if (accuracy >= threshold) {
+                for (const funcData& function : functions) {
+                    if (function.edgeID == graph.componentID && function.pathID == path.id) {
+                        outline.outerLines.push_back(function);
+                    }
+                }
+                for (const bezierData& curve : curves) {
+                    if (curve.edgeID == graph.componentID && curve.pathID == path.id) {
+                        outline.outerCurves.push_back(curve);
+                    }
+                }
+            }
+        }
+    }
+    result.push_back(std::move(outline));
+    return result;
+    }
+
+
+
+
+json pointJSON(const cv::Point& p) {
+    return json::array({p.x, p.y});
+}
+
+json pointJSON(const cv::Point2d& p) {
+    return json::array({p.x, p.y});
+}
+
+json pixelsJSON(const std::vector<cv::Point>& pixels) {
+    json result = json::array();
+
+    for (const auto& p : pixels)
+        result.push_back(pointJSON(p));
+
+    return result;
+}
+
+json lineJSON(const funcData& f) {
+    return {
+        {"id", f.id},
+        {"edgeID", f.edgeID},
+        {"pathID", f.pathID},
+        {"a", f.a},
+        {"b", f.b},
+        {"c", f.c},
+        {"accuracy", f.accuracy},
+        {"start", pointJSON(f.start)},
+        {"end", pointJSON(f.end)},
+        {"pixels", pixelsJSON(f.pixels)}
+    };
+}
+
+json curveJSON(const bezierData& c) {
+    return {
+        {"id", c.id},
+        {"edgeID", c.edgeID},
+        {"pathID", c.pathID},
+        {"startLineID", c.startLineID},
+        {"endLineID", c.endLineID},
+        {"p0", pointJSON(c.p0)},
+        {"p1", pointJSON(c.p1)},
+        {"p2", pointJSON(c.p2)},
+        {"accuracy", c.accuracy},
+        {"pixels", pixelsJSON(c.pixels)}
+    };
+}
+
+void saveMetadata(
+    const std::filesystem::path& outputPath,
+    const std::string& imagePath,
+    const imageData& image,
+    const std::vector<EdgeGraph>& graphs,
+    const std::vector<funcData>& functions,
+    const std::vector<bezierData>& curves,
+    const std::vector<piecewiseData>& pieces,
+    const std::vector<silhouette>& outlines,
+    const metaData& metrics
+) {
+    json data;
+
+    data["version"] = 1;
+    data["imagePath"] = imagePath;
+    data["meshID"] = outputPath.parent_path().filename().string();
+    data["imageID"] = outputPath.stem().string();
+    data["width"] = image.width;
+    data["height"] = image.height;
+
+    data["metrics"] = {
+        {"components", metrics.componentCount},
+        {"endpoints", metrics.endPointData},
+        {"junctions", metrics.junctionData},
+        {"closedLoops", metrics.closedLoopCount},
+        {"normalizedContourLength", metrics.normalizedContourLength},
+        {"normalizedEnclosedArea", metrics.normalizedEnclosedArea}
+    };
+
+    data["graphs"] = json::array();
+
+    for (const auto& graph : graphs) {
+        json g;
+        g["id"] = graph.id;
+        g["componentID"] = graph.componentID;
+        g["nodes"] = json::array();
+        g["paths"] = json::array();
+
+        for (const auto& node : graph.nodes) {
+            g["nodes"].push_back({
+                {"id", node.id},
+                {"pixel", pointJSON(node.pixel)},
+                {"neighbors", node.neighbors}
+            });
+        }
+
+        for (const auto& path : graph.paths) {
+            g["paths"].push_back({
+                {"id", path.id},
+                {"nodeIDs", path.nodeIDs},
+                {"closed", path.closed}
+            });
+        }
+
+        data["graphs"].push_back(std::move(g));
+    }
+
+    data["linearFunctions"] = json::array();
+    for (const auto& f : functions)
+        data["linearFunctions"].push_back(lineJSON(f));
+
+    data["bezierCurves"] = json::array();
+    for (const auto& c : curves)
+        data["bezierCurves"].push_back(curveJSON(c));
+
+    data["piecewisePaths"] = json::array();
+
+    for (const auto& piece : pieces) {
+        json p;
+        p["edgeID"] = piece.edgeID;
+        p["pathID"] = piece.pathID;
+        p["segments"] = json::array();
+
+        for (const auto& segment : piece.segments) {
+            if (std::holds_alternative<funcData>(segment)) {
+                p["segments"].push_back({
+                    {"type", "line"},
+                    {"data", lineJSON(std::get<funcData>(segment))}
+                });
+            } else {
+                p["segments"].push_back({
+                    {"type", "bezier"},
+                    {"data", curveJSON(std::get<bezierData>(segment))}
+                });
             }
         }
 
-        graph.paths = findPaths(graph, startNode);
+        data["piecewisePaths"].push_back(std::move(p));
     }
 
-    // 6. Fit linear functions
-    std::vector<funcData> functions = drawLine(graphs, image);
+    data["silhouettes"] = json::array();
 
-    // 7. Fit quadratic Bezier curves
-    std::vector<bezierData> curves = createCurve(graphs, functions, image);
+    for (const auto& outline : outlines) {
+        json s;
+        s["id"] = outline.id;
+        s["pixels"] = pixelsJSON(outline.pixels);
+        s["outerLines"] = json::array();
+        s["outerCurves"] = json::array();
 
-    // 8. Reduce into piecewise functions
-    std::vector<piecewiseData> reduced =
-        reduceEdges(graphs, functions, curves);
+        for (const auto& f : outline.outerLines)
+            s["outerLines"].push_back(lineJSON(f));
 
-    // 9. Extract metadata
-    metaData data = getData(graphs, image);
+        for (const auto& c : outline.outerCurves)
+            s["outerCurves"].push_back(curveJSON(c));
 
-    // 10. Print results
-    std::cout << "\n--- Pipeline Results ---\n";
-    std::cout << "Components: " << data.componentCount << '\n';
-    std::cout << "Endpoints: " << data.endPointData << '\n';
-    std::cout << "Junctions: " << data.junctionData << '\n';
-    std::cout << "Closed loops: " << data.closedLoopCount << '\n';
-    std::cout << "Normalized contour length: "
-              << data.normalizedContourLength << '\n';
-    std::cout << "Normalized enclosed area: "
-              << data.normalizedEnclosedArea << '\n';
+        data["silhouettes"].push_back(std::move(s));
+    }
 
-    std::cout << "Linear functions: " << functions.size() << '\n';
-    std::cout << "Bezier curves: " << curves.size() << '\n';
-    std::cout << "Piecewise paths: " << reduced.size() << '\n';
+    std::filesystem::create_directories(outputPath.parent_path());
 
-    // 11. Display images
-    cv::imshow("Original Image", image.originalImage);
-    cv::imshow("Skeleton", image.skeleton);
+    std::ofstream file(outputPath);
+    if (!file)
+        throw std::runtime_error("Cannot open " + outputPath.string());
 
-    cv::waitKey(0);
-    cv::destroyAllWindows();
+    file << data.dump(2);
+
+    if (!file)
+        throw std::runtime_error("Failed writing " + outputPath.string());
+}
+
+
+
+
+
+
+
+namespace fs = std::filesystem;
+
+int main() {
+    fs::path inputRoot = R"(F:\CARLA set\renders\github)";
+    fs::path outputRoot = R"(F:\CARLA set\sets\test_edges)";
+
+    const int maxImages = 20;
+    int processed = 0;
+    int failed = 0;
+
+    try {
+        for (const auto& entry :
+             fs::recursive_directory_iterator(inputRoot)) {
+
+            if (processed >= maxImages)
+                break;
+
+            if (!entry.is_regular_file())
+                continue;
+
+            fs::path imagePath = entry.path();
+
+            if (imagePath.extension() != ".png")
+                continue;
+
+            fs::path relativePath =
+                fs::relative(imagePath, inputRoot);
+
+            fs::path outputPath = outputRoot / relativePath;
+            outputPath.replace_extension(".json");
+
+            std::cout << "\nProcessing: "
+                      << imagePath << std::endl;
+
+            try {
+                // 1. Edge detection
+                cv::Mat skeleton =
+                    sobelEdgeDetector(imagePath.string());
+
+                if (skeleton.empty())
+                    throw std::runtime_error("Empty skeleton");
+
+                // 2. Image information
+                imageData image;
+                image.originalImage = cv::imread(imagePath.string());
+
+                if (image.originalImage.empty())
+                    throw std::runtime_error("Image load failed");
+
+                image.width = image.originalImage.cols;
+                image.height = image.originalImage.rows;
+                image.skeleton = skeleton;
+
+                // 3. Connected components
+                std::vector<EdgeData> components =
+                    groupPixels(skeleton);
+
+                // 4. Build graphs
+                std::vector<EdgeGraph> graphs = map(components);
+
+                // 5. Find paths
+                for (EdgeGraph& graph : graphs) {
+                    if (graph.nodes.empty())
+                        continue;
+
+                    int startNode = 0;
+
+                    for (int i = 0;
+                         i < static_cast<int>(graph.nodes.size());
+                         i++) {
+
+                        if (graph.nodes[i].neighbors.size() == 1) {
+                            startNode = i;
+                            break;
+                        }
+                    }
+
+                    graph.paths = findPaths(graph, startNode);
+                }
+
+                // 6. Fit linear functions
+                std::vector<funcData> functions =
+                    drawLine(graphs, image);
+
+                // 7. Fit Bezier curves
+                std::vector<bezierData> curves =
+                    createCurve(graphs, functions, image);
+
+                // 8. Build piecewise paths
+                std::vector<piecewiseData> pieces =
+                    reduceEdges(graphs, functions, curves);
+
+                // 9. Extract silhouette
+                std::vector<silhouette> outlines =
+                    getOutline(graphs, functions, curves, image);
+
+                // 10. Calculate graph metadata
+                metaData metrics = getData(graphs, image);
+
+                // 11. Save complete metadata
+                saveMetadata(
+                    outputPath,
+                    imagePath.string(),
+                    image,
+                    graphs,
+                    functions,
+                    curves,
+                    pieces,
+                    outlines,
+                    metrics
+                );
+
+                ++processed;
+
+                std::cout << "Saved " << processed
+                          << "/" << maxImages
+                          << ": " << outputPath << std::endl;
+
+            } catch (const std::exception& e) {
+                ++failed;
+                std::cerr << "Failed: " << imagePath
+                          << " | " << e.what() << std::endl;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Dataset traversal error: "
+                  << e.what() << std::endl;
+        return 1;
+    }
+
+    std::cout << "\nCompleted!"
+              << "\nImages saved: " << processed
+              << "\nImages failed: " << failed
+              << std::endl;
 
     return 0;
 }
