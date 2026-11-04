@@ -27,8 +27,10 @@
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
-
+#include "edgeEncoder.h"
 using json = nlohmann::json;
+
+
 
 
 struct metaData {
@@ -1275,6 +1277,113 @@ void saveMetadata(
 
 
 
+nlohmann::json encodeImage(const std::string& imagePath) {
+
+    cv::Mat skeleton = sobelEdgeDetector(imagePath);
+
+    if (skeleton.empty()) {
+        throw std::runtime_error("Failed to process image: " + imagePath);
+    }
+
+    imageData image;
+    image.originalImage = cv::imread(imagePath);
+
+    if (image.originalImage.empty()) {
+        throw std::runtime_error("Failed to load image: " + imagePath);
+    }
+
+    image.width = image.originalImage.cols;
+    image.height = image.originalImage.rows;
+    image.skeleton = skeleton;
+
+    std::vector<EdgeData> components = groupPixels(skeleton);
+
+    std::vector<EdgeGraph> graphs = map(components);
+
+    for (EdgeGraph& graph : graphs) {
+
+        if (graph.nodes.empty()) {
+            continue;
+        }
+
+        int startNode = 0;
+
+        for (int i = 0; i < static_cast<int>(graph.nodes.size()); i++) {
+
+            if (graph.nodes[i].neighbors.size() == 1) {
+                startNode = i;
+                break;
+            }
+        }
+
+        graph.paths = findPaths(graph, startNode);
+    }
+
+    std::vector<funcData> functions =
+        drawLine(graphs, image);
+
+    std::vector<bezierData> curves =
+        createCurve(graphs, functions, image);
+
+    std::vector<piecewiseData> pieces =
+        reduceEdges(graphs, functions, curves);
+
+    std::vector<silhouette> outlines =
+        getOutline(graphs, functions, curves, image);
+
+    metaData metrics = getData(graphs, image);
+
+    nlohmann::json metadata;
+
+    metadata["version"] = 1;
+    metadata["imagePath"] = imagePath;
+    metadata["width"] = image.width;
+    metadata["height"] = image.height;
+
+    metadata["metrics"] = {
+        {"components", metrics.componentCount},
+        {"endpoints", metrics.endPointData},
+        {"junctions", metrics.junctionData},
+        {"closedLoops", metrics.closedLoopCount},
+        {"normalizedContourLength", metrics.normalizedContourLength},
+        {"normalizedEnclosedArea", metrics.normalizedEnclosedArea}
+    };
+
+    metadata["piecewisePaths"] = nlohmann::json::array();
+
+    for (const piecewiseData& piece : pieces) {
+
+        nlohmann::json path;
+
+        path["edgeID"] = piece.edgeID;
+        path["pathID"] = piece.pathID;
+        path["segments"] = nlohmann::json::array();
+
+        for (const auto& segment : piece.segments) {
+
+            if (std::holds_alternative<funcData>(segment)) {
+
+                path["segments"].push_back({
+                    {"type", "line"},
+                    {"data", lineJSON(std::get<funcData>(segment))}
+                });
+
+            } else {
+
+                path["segments"].push_back({
+                    {"type", "bezier"},
+                    {"data", curveJSON(std::get<bezierData>(segment))}
+                });
+            }
+        }
+
+        metadata["piecewisePaths"].push_back(std::move(path));
+    }
+
+    return metadata;
+}
+
+
 
 
 
@@ -1314,14 +1423,13 @@ int main() {
                       << imagePath << std::endl;
 
             try {
-                // 1. Edge detection
+
                 cv::Mat skeleton =
                     sobelEdgeDetector(imagePath.string());
 
                 if (skeleton.empty())
                     throw std::runtime_error("Empty skeleton");
 
-                // 2. Image information
                 imageData image;
                 image.originalImage = cv::imread(imagePath.string());
 
@@ -1332,14 +1440,11 @@ int main() {
                 image.height = image.originalImage.rows;
                 image.skeleton = skeleton;
 
-                // 3. Connected components
                 std::vector<EdgeData> components =
                     groupPixels(skeleton);
 
-                // 4. Build graphs
                 std::vector<EdgeGraph> graphs = map(components);
 
-                // 5. Find paths
                 for (EdgeGraph& graph : graphs) {
                     if (graph.nodes.empty())
                         continue;
@@ -1359,26 +1464,20 @@ int main() {
                     graph.paths = findPaths(graph, startNode);
                 }
 
-                // 6. Fit linear functions
                 std::vector<funcData> functions =
                     drawLine(graphs, image);
 
-                // 7. Fit Bezier curves
                 std::vector<bezierData> curves =
                     createCurve(graphs, functions, image);
 
-                // 8. Build piecewise paths
                 std::vector<piecewiseData> pieces =
                     reduceEdges(graphs, functions, curves);
 
-                // 9. Extract silhouette
                 std::vector<silhouette> outlines =
                     getOutline(graphs, functions, curves, image);
 
-                // 10. Calculate graph metadata
                 metaData metrics = getData(graphs, image);
 
-                // 11. Save complete metadata
                 saveMetadata(
                     outputPath,
                     imagePath.string(),
@@ -1416,3 +1515,4 @@ int main() {
 
     return 0;
 }
+
