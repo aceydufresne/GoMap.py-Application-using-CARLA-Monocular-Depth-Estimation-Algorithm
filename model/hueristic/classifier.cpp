@@ -46,7 +46,7 @@ struct FunctionOccurrence {
     int functionID;
 };
 
-struct FunctionPattern {
+struct functionPattern {
     int patternID;
     std::string type;
     std::vector<double> descriptor;
@@ -65,7 +65,20 @@ struct PathRecord {
     std::vector<int> patternIDs;
 };
 
+struct matchCandidate {
+    std::string meshID;
+    std::string imageID;
 
+    int matchedFunctions = 0;
+    int matchedNeighbors = 0;
+
+    double score = 0.0;
+};
+
+struct TokenDataset {
+    std::vector<functionPattern> patterns;
+    std::vector<PathRecord> paths;
+};
 
 
 std::vector<double> createDescriptor(const std::string& type, const json& function, double imageDiagonal) {
@@ -164,10 +177,10 @@ bool matchLinear(const std::vector<double>& a, const std::vector<double>& b, dou
 
 
 
-void vectorizeToken(const fs::path& datasetRoot){
+TokenDataset vectorizeToken(const fs::path& datasetRoot){
     //example output
     fs::path outputPath = datasetRoot / "function_patterns.txt";
-    std::vector<FunctionPattern> patterns;
+    std::vector<functionPattern> patterns;
     std::vector<PathRecord> pathRecords;
     //traversal information
     int nextPatternID = 0;
@@ -209,6 +222,7 @@ void vectorizeToken(const fs::path& datasetRoot){
 
             //iterate through components
             for(const auto& path : piecewisePaths) {
+                    //std::cout << "First pass starting\n";
                     //collect the edgemap information
                     int componentID = path.at("edgeID").get<int>();
                     int pathID = path.at("pathID").get<int>();
@@ -217,8 +231,10 @@ void vectorizeToken(const fs::path& datasetRoot){
                     record.imageID = imageID;
                     record.componentID = componentID;
                     record.pathID = pathID;
+
                     //traverse paths
                     for(const auto& segment: path.at("segments")){
+                        //std::cout << "second loop pass starting\n";
                         std::string type = segment.at("type").get<std::string>();
                         const auto& function = segment.at("data");
                         int functionID = function.at("id").get<int>();
@@ -240,6 +256,7 @@ void vectorizeToken(const fs::path& datasetRoot){
 
                         //collected functions
                         for(size_t i = 0; i < patterns.size(); i++){
+                            //std::cout << "259\n";
                             if(patterns[i].type != type){
                                 continue;
                             }
@@ -261,7 +278,7 @@ void vectorizeToken(const fs::path& datasetRoot){
                         //now matching functions
                         if(matchedPattern == -1){
                             //move on
-                            FunctionPattern pattern;
+                            functionPattern pattern;
                             pattern.patternID = nextPatternID++;
                             pattern.type = type;
                             pattern.descriptor = descriptor;
@@ -284,18 +301,204 @@ void vectorizeToken(const fs::path& datasetRoot){
                 std::cerr << "error" << entry.path() << ":" << e.what() << '\n';
             }
     }
-
+    return {std::move(patterns), std::move(pathRecords)};
 }
 
 
-void match(const fs::path& inputJSON, const std::vector<functionPattern>& patterns){
+
+int verifyNeighbors(const PathRecord& inputPath, const PathRecord& candidatePath, int inputIndex, int candidateIndex) {
+    int matches = 0;
+    const auto& input = inputPath.patternIDs;
+    const auto& candidate = candidatePath.patternIDs;
+    //check the preceding neighbor
+    if (inputIndex > 0 && candidateIndex > 0) {
+        if (input[inputIndex - 1] == candidate[candidateIndex - 1]) {
+            matches++;
+        }
+    }
+    //Check the following neighbor
+    if (inputIndex + 1 < static_cast<int>(input.size()) &&
+        candidateIndex + 1 < static_cast<int>(candidate.size())) {
+
+        if (input[inputIndex + 1] == candidate[candidateIndex + 1]) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+
+
+
+std::vector<matchCandidate> match(const json& input, const std::vector<functionPattern>& patterns, const std::vector<PathRecord>& datasetPaths) {
+
+    double diagonal = std::hypot(input.at("width").get<double>(), input.at("height").get<double>());
+    std::vector<matchCandidate> candidates;
+
+    //traverse through components
+    for (const auto& path : input.at("piecewisePaths")) {
+        //create a record for the current input path
+        PathRecord inputPath;
+        inputPath.componentID = path.at("edgeID").get<int>();
+        inputPath.pathID = path.at("pathID").get<int>();
+        const auto& segments = path.at("segments");
+
+        for (const auto& segment : segments) {
+            std::string type = segment.at("type").get<std::string>();
+            const json& function = segment.at("data");
+
+            std::vector<double> descriptor = createDescriptor(type, function, diagonal);
+            int matchedPatternID = -1;
+
+            for (const functionPattern& pattern : patterns) {
+                if (pattern.type != type) {
+                    continue;
+                }
+                bool matched = false;
+                if (type == "line") {
+                    matched = matchLinear(descriptor, pattern.descriptor, 10.0, 0.10);
+                }
+                else if (type == "bezier") {
+                    matched =
+                        descriptorDistance(descriptor, pattern.descriptor) <= 0.05;
+                }
+                if (matched) {
+                    matchedPatternID = pattern.patternID;
+                    break;
+                }
+            }
+            inputPath.functionIDs.push_back(function.at("id").get<int>());
+            inputPath.patternIDs.push_back(matchedPatternID);
+        }
+
+        //iterate through segments while tracking their positions
+        for (size_t inputIndex = 0; inputIndex < segments.size(); ++inputIndex) {
+            const auto& segment = segments[inputIndex];
+            std::string type = segment.at("type");
+            const json& function = segment.at("data");
+
+            std::vector<double> descriptor = createDescriptor(type, function, diagonal);
+             //begin comparisions with the current function dataset
+            for(const functionPattern& pattern: patterns){
+                if(pattern.type != type){
+                    continue;
+                }
+                bool matched = false;
+                //linear
+                if(type == "line"){
+                    matched = matchLinear(descriptor, pattern.descriptor, 10.0, 0.10);
+                }
+                else if(type == "bezier"){
+                    double distance = descriptorDistance(descriptor, pattern.descriptor);
+                    matched = (distance <= 0.05);
+                }
+                //dont have this line in the set yet
+                if(!matched){
+                    continue;
+                }
+                for(const auto& occurrence: pattern.occurrences){
+                    //check neighbors
+                    int neighborMatches = 0;
+                    //existing cnadidates
+                    
+                    auto pathIt = std::find_if(datasetPaths.begin(), datasetPaths.end(), [&](const PathRecord& record) {
+                        return record.meshID == occurrence.meshID && record.imageID == occurrence.imageID && record.componentID == occurrence.componentID && record.pathID == occurrence.pathID;
+                    });
+
+                    int candidateIndex = -1;
+
+                    if (pathIt != datasetPaths.end()) {
+                        const PathRecord& candidatePath = *pathIt;
+                        auto functionIt = std::find(candidatePath.functionIDs.begin(), candidatePath.functionIDs.end(), occurrence.functionID);
+
+                        if (functionIt != candidatePath.functionIDs.end()) {
+                            candidateIndex = static_cast<int>(std::distance(candidatePath.functionIDs.begin(), functionIt));
+                        }
+                    }
+                    if (pathIt != datasetPaths.end() && candidateIndex >= 0) {
+                        neighborMatches = verifyNeighbors(
+                            inputPath,
+                            *pathIt,
+                            static_cast<int>(inputIndex),
+                            candidateIndex
+                        );
+                    }
+                    auto it = std::find_if(candidates.begin(),candidates.end(),[&](const matchCandidate& candidate) {
+                        //if the matching function also has matching neighbors with the input
+                        return candidate.meshID == occurrence.meshID && candidate.imageID == occurrence.imageID;
+                        });
+                    if(it == candidates.end()){
+                        matchCandidate candidate;
+                        candidate.meshID = occurrence.meshID;
+                        candidate.imageID = occurrence.imageID;
+                        candidates.push_back(candidate);
+                        it = std::prev(candidates.end());
+                    }
+                    it->matchedFunctions++;
+                    //keep track of the matching neighbors as well
+                    it->matchedNeighbors+=neighborMatches;
+                }
+            }
+        }
     
+           
+        }
+    
+    //soft ranking based on how many matching neighbors a function has
+    for(matchCandidate& candidate: candidates){
+        candidate.score = candidate.matchedFunctions + (2.0 * candidate.matchedNeighbors);
+    }
+    //find highest scoring edgemap
+    std::sort(
+        candidates.begin(), candidates.end(), [](const matchCandidate& a, const matchCandidate& b) {
+            return a.score > b.score;
+        }
+    );
+
+
+    return candidates;
 }
 
 
-int main(){
-    fs::path datasetRoot =R"(F:\CARLA set\sets\test_edges)";
-    vectorizeToken(datasetRoot);
+
+int main() {
+    fs::path datasetRoot =
+        R"(F:\CARLA set\sets\test_edges)";
+
+    // Load the existing 20-image dataset
+    TokenDataset dataset = vectorizeToken(datasetRoot);
+
+    // New image not included in the dataset
+    fs::path imagePath =
+        R"(F:\CARLA set\renders\github\b684b5a1e0c38b6c1186c934f5d59fe4ed2afcf92c7d8329f0b837e880e30272\011.png)";
+
+    // Encode the new image into edge metadata
+    std::cout << "Encoding image..." << std::endl;
+    json inputMetadata = encodeImage(imagePath.string());
+
+    // Match against existing dataset
+    std::cout << "Matching functions..." << std::endl;
+    std::vector<matchCandidate> candidates = match(
+    inputMetadata,
+    dataset.patterns,
+    dataset.paths
+    );
+
+    // Display ranked candidates
+    std::cout << "\nTotal candidates: " << candidates.size() << '\n';
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const matchCandidate& candidate = candidates[i];
+
+        std::cout
+            << "Rank: " << i + 1
+            << " | Mesh: " << candidate.meshID
+            << " | Image: " << candidate.imageID
+            << " | Functions: " << candidate.matchedFunctions
+            << " | Neighbors: " << candidate.matchedNeighbors
+            << " | Score: " << candidate.score
+            << '\n';
+    }
 
     return 0;
 }
