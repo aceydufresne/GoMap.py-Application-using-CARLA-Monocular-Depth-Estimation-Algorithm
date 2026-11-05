@@ -30,14 +30,18 @@ def runPipeline(imagePath):
     print("Reconstructing 3D coordinates...")
 
     start([blenderPath, "--background", "--python", raycast, "--", "--matches", matchesJson, "--output", pointsJson])
-
+    if not pointsJson.is_file():
+        raise RuntimeError(
+        f"Blender finished without creating: {pointsJson}"
+    )
+    print("3D point cloud generated successfully!")
     print("Pipeline complete!")
     print("3D coordinates saved to:", pointsJson)
     
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image", help="Path to input image")
-
-    args = parser.parse_args()
-
-    runPipeline(args.image)
+    #parser = argparse.ArgumentParser()
+    #parser.add_argument("image", help="Path to input image")
+    #args = parser.parse_args()
+    #runPipeline(args.image)
+    imagePath = r"F:\CARLA set\renders\github\b684b5a1e0c38b6c1186c934f5d59fe4ed2afcf92c7d8329f0b837e880e30272\011.png"
+    runPipeline(imagePath)
