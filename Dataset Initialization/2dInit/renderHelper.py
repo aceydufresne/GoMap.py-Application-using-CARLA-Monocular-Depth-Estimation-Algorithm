@@ -44,6 +44,8 @@ def navigator():
         #renderPath = os.path.join(outputPath, id)
         #os.makedirs(renderPath, exist_ok= True)
     for file in os.listdir(gitSet):
+        if not file.lower().endswith(".glb"):
+            continue
         #print(file)
         fullPath = os.path.join(gitSet, file)
         id = os.path.splitext(file)[0]
@@ -52,32 +54,54 @@ def navigator():
     
     for subdir, dirs, files in os.walk(sketchSet):
             for file in files:
+                if not file.lower().endswith(".glb"):
+                    continue
                 id = os.path.splitext(file)[0]
                 fullPath = os.path.join(subdir, file)
                 renderPath = os.path.join(sketchRender, id)
                 sketchArray.append((fullPath, renderPath))
     for file in os.listdir(smithSet):
+        if not file.lower().endswith(".glb"):
+            continue
         #print(file)
         id = os.path.splitext(file)[0]
         fullPath = os.path.join(smithSet, file)
         renderPath = os.path.join(smithRender, id)
         smithArray.append((fullPath, renderPath))
         
-#running/saving images into directory
-    for mesh in gitArray:
-        renderPath = mesh[1]
-        fullPath = mesh[0]
-        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", fullPath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
-        #hash from initial encoding script
-        id = os.path.splitext(os.path.basename(mesh[0]))[0]
-    for mesh in sketchArray:
-        renderPath = mesh[1]
-        fullPath = mesh[0]
-        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", fullPath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
-    for mesh in smithArray:
-        renderPath = mesh[1]
-        fullPath = mesh[0]
-        subprocess.run([blenderPath, "--background", "--python", blenderScript, "--", "--object_path", fullPath, "--output_dir", renderPath, "--num_renders", "12"], check = True)
+    
+        
+    for mesh in gitArray + sketchArray + smithArray:
+        fullPath, renderPath = mesh
+
+        # Check whether all 12 images and camera matrices exist
+        complete = all(
+            os.path.isfile(os.path.join(renderPath, f"{i:03d}.png"))
+            and os.path.isfile(os.path.join(renderPath, f"{i:03d}.npy"))
+            for i in range(12)
+        )
+
+        if complete:
+            print(f"Skipping already rendered mesh: {fullPath}")
+            continue
+
+        # Render missing or incomplete meshes
+        print(f"Rendering: {fullPath}")
+
+        try:
+            subprocess.run([
+                blenderPath,
+                "--background",
+                "--python", blenderScript,
+                "--",
+                "--object_path", fullPath,
+                "--output_dir", renderPath,
+                "--num_renders", "12"
+            ], check=True)
+
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to render {fullPath}: {e}")
+            continue
         
     
     
