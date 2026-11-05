@@ -80,6 +80,21 @@ struct TokenDataset {
     std::vector<PathRecord> paths;
 };
 
+//this is passed to the bpy script to create the pointcloud
+struct PointMatch {
+    int patternID = -1;
+
+    std::string meshID;
+    std::string imageID;
+
+    int componentID = -1;
+    int pathID = -1;
+    int functionID = -1;
+
+    std::string type;
+    double distance = 0.0;
+};
+
 
 std::vector<double> createDescriptor(const std::string& type, const json& function, double imageDiagonal) {
     std::vector<double> descriptor;
@@ -460,45 +475,189 @@ std::vector<matchCandidate> match(const json& input, const std::vector<functionP
 }
 
 
+//temp export function, no heavy calculations
+std::vector<PointMatch> findPoints(
+    const json& input,
+    const TokenDataset& dataset,
+    const std::vector<matchCandidate>& candidates
+) {
+    std::vector<PointMatch> results;
+    std::unordered_set<int> selectedPatterns;
 
-int main() {
-    fs::path datasetRoot =
-        R"(F:\CARLA set\sets\test_edges)";
+    if (candidates.empty())
+        return results;
 
-    // Load the existing 20-image dataset
-    TokenDataset dataset = vectorizeToken(datasetRoot);
+    const std::string bestMeshID = candidates.front().meshID;
 
-    // New image not included in the dataset
-    fs::path imagePath =
-        R"(F:\CARLA set\renders\github\b684b5a1e0c38b6c1186c934f5d59fe4ed2afcf92c7d8329f0b837e880e30272\011.png)";
-
-    // Encode the new image into edge metadata
-    std::cout << "Encoding image..." << std::endl;
-    json inputMetadata = encodeImage(imagePath.string());
-
-    // Match against existing dataset
-    std::cout << "Matching functions..." << std::endl;
-    std::vector<matchCandidate> candidates = match(
-    inputMetadata,
-    dataset.patterns,
-    dataset.paths
+    double diagonal = std::hypot(
+        input.at("width").get<double>(),
+        input.at("height").get<double>()
     );
 
-    // Display ranked candidates
-    std::cout << "\nTotal candidates: " << candidates.size() << '\n';
+    for (const auto& path : input.at("piecewisePaths")) {
+        for (const auto& segment : path.at("segments")) {
 
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        const matchCandidate& candidate = candidates[i];
+            std::string type = segment.at("type").get<std::string>();
+            const json& function = segment.at("data");
 
-        std::cout
-            << "Rank: " << i + 1
-            << " | Mesh: " << candidate.meshID
-            << " | Image: " << candidate.imageID
-            << " | Functions: " << candidate.matchedFunctions
-            << " | Neighbors: " << candidate.matchedNeighbors
-            << " | Score: " << candidate.score
-            << '\n';
+            std::vector<double> descriptor =
+                createDescriptor(type, function, diagonal);
+
+            int bestPatternID = -1;
+            double bestDistance = std::numeric_limits<double>::infinity();
+            const functionPattern* bestPattern = nullptr;
+
+            // Find the closest matching function pattern
+            for (const auto& pattern : dataset.patterns) {
+                if (pattern.type != type)
+                    continue;
+
+                bool matched = false;
+                double distance = descriptorDistance(
+                    descriptor, pattern.descriptor
+                );
+
+                if (type == "line") {
+                    matched = matchLinear(
+                        descriptor, pattern.descriptor, 10.0, 0.10
+                    );
+                }
+                else if (type == "bezier") {
+                    matched = distance <= 0.05;
+                }
+
+                if (matched && distance < bestDistance) {
+                    bestDistance = distance;
+                    bestPatternID = pattern.patternID;
+                    bestPattern = &pattern;
+                }
+            }
+
+            if (bestPattern == nullptr)
+                continue;
+
+            // Return one occurrence per distinct pattern
+            if (!selectedPatterns.insert(bestPatternID).second)
+                continue;
+
+            const FunctionOccurrence* selectedOccurrence = nullptr;
+
+            // Prefer an occurrence from the highest-ranked mesh
+            for (const auto& occurrence : bestPattern->occurrences) {
+                if (occurrence.meshID == bestMeshID) {
+                    selectedOccurrence = &occurrence;
+                    break;
+                }
+            }
+
+            // Fall back to another mesh when necessary
+            if (selectedOccurrence == nullptr &&
+                !bestPattern->occurrences.empty()) {
+                selectedOccurrence = &bestPattern->occurrences.front();
+            }
+
+            if (selectedOccurrence == nullptr)
+                continue;
+
+            PointMatch result;
+            result.patternID = bestPatternID;
+            result.meshID = selectedOccurrence->meshID;
+            result.imageID = selectedOccurrence->imageID;
+            result.componentID = selectedOccurrence->componentID;
+            result.pathID = selectedOccurrence->pathID;
+            result.functionID = selectedOccurrence->functionID;
+            result.type = type;
+            result.distance = bestDistance;
+
+            results.push_back(std::move(result));
+        }
     }
+
+    return results;
+}
+
+
+void exportPointMatches(
+    const std::vector<PointMatch>& matches,
+    const fs::path& outputPath
+) {
+    json output;
+    output["matches"] = json::array();
+
+    for (const PointMatch& match : matches) {
+        output["matches"].push_back({
+            {"patternID", match.patternID},
+            {"meshID", match.meshID},
+            {"imageID", match.imageID},
+            {"componentID", match.componentID},
+            {"pathID", match.pathID},
+            {"functionID", match.functionID},
+            {"type", match.type},
+            {"distance", match.distance}
+        });
+    }
+
+    std::ofstream file(outputPath);
+
+    if (!file) {
+        throw std::runtime_error(
+            "Failed to open output file: " + outputPath.string()
+        );
+    }
+
+    file << output.dump(2);
+}
+
+
+
+
+int main(int argc, char* argv[]) {
+    std::string imagePath;
+    std::string outputPath;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if (arg == "--input" && i + 1 < argc) {
+            imagePath = argv[++i];
+        }
+        else if (arg == "--output" && i + 1 < argc) {
+            outputPath = argv[++i];
+        }
+    }
+
+    if (imagePath.empty() || outputPath.empty()) {
+        std::cerr
+            << "Usage: classifier.exe --input IMAGE --output JSON\n";
+        return 1;
+    }
+
+    json input = encodeImage(imagePath);
+
+    std::string datasetRoot =
+        R"(F:\CARLA set\sets\test_edges)";
+
+    TokenDataset dataset = vectorizeToken(datasetRoot);
+
+    std::vector<matchCandidate> candidates = match(
+        input,
+        dataset.patterns,
+        dataset.paths
+    );
+
+    std::vector<PointMatch> selected = findPoints(
+        input,
+        dataset,
+        candidates
+    );
+
+    exportPointMatches(selected, outputPath);
+
+    std::cout << "Matched functions: "
+              << selected.size() << std::endl;
+
+    std::cout << "Exported matches to: "
+              << outputPath << std::endl;
 
     return 0;
 }
