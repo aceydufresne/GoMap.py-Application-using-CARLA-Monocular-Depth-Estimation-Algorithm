@@ -1389,7 +1389,7 @@ nlohmann::json encodeImage(const std::string& imagePath) {
 
 
 namespace fs = std::filesystem;
-
+#ifndef EDGE_ENCODER_LIBRARY
 int main() {
     fs::path inputRoot = R"(F:\CARLA set\renders\github)";
     fs::path outputRoot = R"(F:\CARLA set\sets\test_edges)";
@@ -1515,4 +1515,4 @@ int main() {
 
     return 0;
 }
-
+#endif
