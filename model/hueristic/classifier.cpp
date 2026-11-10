@@ -14,7 +14,8 @@
 #include <stdexcept>
 #include <map>
 #include <utility>
-
+#include <set>
+#include <tuple>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -128,6 +129,37 @@ struct EdgeFunction {
     json parameters;
 };
 
+//group functions into larger clusters
+struct FunctionCluster {
+    int clusterID = -1;
+    //not the same grouping as the components, based on recurring connectivity
+    std::vector<int> tokenIDs;
+
+    int frequency = 0;
+};
+
+
+struct EdgeMapSignature {
+    std::string meshID;
+    std::string imageID;
+
+    std::unordered_map<int, int> tokenFrequency;
+    std::unordered_map<int, int> clusterFrequency;
+
+    int componentCount = 0;
+    int pathCount = 0;
+};
+
+struct EdgeMapCandidate {
+    int edgeMapID = -1;
+
+    std::string meshID;
+    std::string imageID;
+
+    double tokenSimilarity = 0.0;
+    double clusterSimilarity = 0.0;
+    double score = 0.0;
+};
 
 std::vector<double> createDescriptor(const std::string& type, const json& function, double imageDiagonal) {
     std::vector<double> descriptor;
@@ -987,6 +1019,76 @@ void initializeDatabase(sqlite3* db) {
             FOREIGN KEY(firstToken) REFERENCES tokens(tokenID),
             FOREIGN KEY(secondToken) REFERENCES tokens(tokenID)
         );
+        CREATE TABLE IF NOT EXISTS function_clusters (
+        clusterID INTEGER PRIMARY KEY,
+        tokenSequence TEXT NOT NULL UNIQUE,
+        tokenCount INTEGER NOT NULL,
+        frequency INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS cluster_occurrences (
+        clusterID INTEGER NOT NULL,
+        pathKey INTEGER NOT NULL,
+        startIndex INTEGER NOT NULL,
+        endIndex INTEGER NOT NULL,
+
+        PRIMARY KEY(clusterID, pathKey, startIndex),
+
+        FOREIGN KEY(clusterID)
+            REFERENCES function_clusters(clusterID),
+
+        FOREIGN KEY(pathKey)
+            REFERENCES paths(pathKey)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cluster_occurrences_path
+    ON cluster_occurrences(pathKey);
+
+    CREATE TABLE IF NOT EXISTS edge_maps (
+    edgeMapID INTEGER PRIMARY KEY,
+    meshID TEXT NOT NULL,
+    imageID TEXT NOT NULL,
+
+    componentCount INTEGER DEFAULT 0,
+    pathCount INTEGER DEFAULT 0,
+
+    UNIQUE(meshID, imageID)
+    );
+
+    CREATE TABLE IF NOT EXISTS edge_map_features (
+        edgeMapID INTEGER NOT NULL,
+        featureType TEXT NOT NULL,
+        featureID INTEGER NOT NULL,
+        frequency INTEGER NOT NULL,
+
+        PRIMARY KEY(edgeMapID, featureType, featureID),
+
+        FOREIGN KEY(edgeMapID)
+            REFERENCES edge_maps(edgeMapID)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_edge_map_feature_lookup
+    ON edge_map_features(featureType, featureID);
+
+        CREATE TABLE IF NOT EXISTS token_neighbors (
+        tokenID INTEGER NOT NULL,
+        neighborTokenID INTEGER NOT NULL,
+        relativePosition INTEGER NOT NULL,
+        frequency INTEGER NOT NULL,
+
+        PRIMARY KEY (
+            tokenID,
+            neighborTokenID,
+            relativePosition
+        ),
+
+        FOREIGN KEY(tokenID) REFERENCES tokens(tokenID),
+        FOREIGN KEY(neighborTokenID) REFERENCES tokens(tokenID)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_token_neighbors
+    ON token_neighbors(tokenID, relativePosition);
+
     )SQL";
 
     char* errorMessage = nullptr;
@@ -1718,65 +1820,884 @@ void exportPointMatches(
 }
 
 
+//grouping similiar edgemaps
+void objectLookup(sqlite3* db){
+    //add exsiting neighbors from the existing sqlite table
+    const char* sql = R"SQL(
+        INSERT INTO token_neighbors (
+            tokenID,
+            neighborTokenID,
+            relativePosition,
+            frequency
+        )
+
+        SELECT
+            a.tokenID,
+            b.tokenID,
+            CASE
+                WHEN b.sequenceIndex < a.sequenceIndex
+                    THEN -1
+                ELSE 1
+            END,
+            COUNT(*)
+
+        FROM path_functions a
+
+        JOIN path_functions b
+            ON a.pathKey = b.pathKey
+            AND (
+                b.sequenceIndex = a.sequenceIndex - 1
+                OR
+                b.sequenceIndex = a.sequenceIndex + 1
+            )
+
+        GROUP BY
+            a.tokenID,
+            b.tokenID,
+            CASE
+                WHEN b.sequenceIndex < a.sequenceIndex
+                    THEN -1
+                ELSE 1
+            END
+
+        ON CONFLICT(
+            tokenID,
+            neighborTokenID,
+            relativePosition
+        )
+
+        DO UPDATE SET
+            frequency = excluded.frequency;
+    )SQL";
+
+    char* error = nullptr;
+    int result = sqlite3_exec(db, sql, nullptr, nullptr, &error);
+
+    if (result != SQLITE_OK) {
+        std::string message =
+            error ? error : "SQLite error";
+        sqlite3_free(error);
+        throw std::runtime_error(message);
+    }
+
+    std::cout<< "Token connectivity lookup built.\n";
+}
 
 
-int main(int argc, char* argv[]) {
 
-if (argc > 1 && std::string(argv[1]) == "--build-database") {
+void groupConnectedNeighbors(sqlite3* db, int minimumFrequency = 2, int maximumClusterSize = 5) {
+    if (minimumFrequency < 1 || maximumClusterSize < 2) {
+        throw std::invalid_argument("Invalid clustering parameters");
+    }
 
-    fs::path datasetRoot = R"(F:\CARLA set\sets\test_edges)";
-    fs::path databasePath = R"(F:\CARLA set\model\tokens.db)";
+    struct Occurrence {
+        int pathKey;
+        int startIndex;
+        int endIndex;
+    };
+
+    using Sequence = std::vector<int>;
+
+    //maps a token sequence to its occurrences.
+    std::map<Sequence, std::vector<Occurrence>> clusters;
+
+    const char* sql = R"SQL(
+        SELECT pathKey, sequenceIndex, tokenID
+        FROM path_functions
+        ORDER BY pathKey, sequenceIndex;
+    )SQL";
+
+    sqlite3_stmt* stmt = nullptr;
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(sqlite3_errmsg(db));
+    }
+
+    //each path stores its ordered token sequence.
+    struct PathToken {
+        int sequenceIndex;
+        int tokenID;
+    };
+    std::map<int, std::vector<PathToken>> paths;
+    int rc;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int pathKey = sqlite3_column_int(stmt, 0);
+        int sequenceIndex = sqlite3_column_int(stmt, 1);
+        int tokenID = sqlite3_column_int(stmt, 2);
+
+        paths[pathKey].push_back({
+            sequenceIndex,
+            tokenID
+        });
+    }
+
+    if (rc != SQLITE_DONE) {
+        std::string error = sqlite3_errmsg(db);
+        sqlite3_finalize(stmt);
+        throw std::runtime_error(error);
+    }
+    sqlite3_finalize(stmt);
+
+    //finder connected sequences.
+    for (const auto& [pathKey, tokens] : paths) {
+        for (size_t start = 0; start < tokens.size(); ++start) {
+            Sequence sequence;
+
+            for (size_t length = 1; length <= static_cast<size_t>(maximumClusterSize) && start + length <= tokens.size(); ++length) {
+                size_t index = start + length - 1;
+                //require consecutive positions in the same path.
+                if (index > start &&
+                    tokens[index].sequenceIndex !=
+                    tokens[index - 1].sequenceIndex + 1) {
+                    break;
+                }
+                sequence.push_back(tokens[index].tokenID);
+                if (length < 2) {
+                    continue;
+                }
+
+                clusters[sequence].push_back({
+                    pathKey,
+                    tokens[start].sequenceIndex,
+                    tokens[index].sequenceIndex
+                });
+            }
+        }
+    }
+
+    //sqlite handler
+    auto execute = [&](const char* statement) {
+        char* error = nullptr;
+
+        if (sqlite3_exec(db, statement, nullptr, nullptr, &error)
+            != SQLITE_OK) {
+            std::string message = error ? error : "SQLite error";
+            sqlite3_free(error);
+            throw std::runtime_error(message);
+        }
+    };
+
+    sqlite3_stmt* insertCluster = nullptr;
+    sqlite3_stmt* insertOccurrence = nullptr;
 
     try {
-        std::cout << "Loading dataset edges...\n";
+        execute("BEGIN IMMEDIATE TRANSACTION;");
 
-        auto functions = loadDatasetEdges(datasetRoot);
+        //rebuild the cluster index.
+        execute("DELETE FROM cluster_occurrences;");
+        execute("DELETE FROM function_clusters;");
 
-        std::cout << "Functions loaded: "
-                  << functions.size() << '\n';
+        const char* clusterSQL = R"SQL(
+            INSERT INTO function_clusters
+                (tokenSequence, tokenCount, frequency)
+            VALUES (?, ?, ?);
+        )SQL";
 
-        // Open database BEFORE tokenization
-        sqlite3* db = openDatabase(databasePath.string());
+        const char* occurrenceSQL = R"SQL(
+            INSERT INTO cluster_occurrences
+                (clusterID, pathKey, startIndex, endIndex)
+            VALUES (?, ?, ?, ?);
+        )SQL";
 
-        try {
-            std::cout << "Tokenizing functions...\n";
+        if (sqlite3_prepare_v2(db, clusterSQL, -1,
+                               &insertCluster, nullptr) != SQLITE_OK ||
+            sqlite3_prepare_v2(db, occurrenceSQL, -1,
+                               &insertOccurrence, nullptr) != SQLITE_OK) {
+            throw std::runtime_error(sqlite3_errmsg(db));
+        }
+        int createdClusters = 0;
 
-            // SQLite connection is now passed to tokenizeFunctions
-            auto dataset = tokenizeFunctions(db, functions);
+        for (const auto& [sequence, occurrences] : clusters) {
+            if (static_cast<int>(occurrences.size())
+                < minimumFrequency) {
+                continue;
+            }
 
-            std::cout << "Unique tokens: "
-                      << dataset.patterns.size() << '\n';
+            std::string sequenceJSON = json(sequence).dump();
+            sqlite3_bind_text(insertCluster, 1, sequenceJSON.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(insertCluster, 2, static_cast<int>(sequence.size()));
+            sqlite3_bind_int(insertCluster, 3, static_cast<int>(occurrences.size()));
 
-            saveTokenDataset(db, dataset, functions);
+            if (sqlite3_step(insertCluster) != SQLITE_DONE) {
+                throw std::runtime_error(sqlite3_errmsg(db));
+            }
+            sqlite3_reset(insertCluster);
+            sqlite3_clear_bindings(insertCluster);
 
-            // Discover frequently occurring pairs
-            mergeTokens(db, 2);
+            int clusterID =static_cast<int>(sqlite3_last_insert_rowid(db));
 
-            // Encode paths using the composite tokens
-            encodeCompositeTokens(db);
+            for (const Occurrence& occurrence : occurrences) {
+                sqlite3_bind_int(insertOccurrence, 1, clusterID);
+                sqlite3_bind_int(insertOccurrence, 2, occurrence.pathKey);
+                sqlite3_bind_int(insertOccurrence, 3, occurrence.startIndex);
+                sqlite3_bind_int(insertOccurrence, 4, occurrence.endIndex);
 
-        } catch (...) {
-            sqlite3_close(db);
-            throw;
+                if (sqlite3_step(insertOccurrence) != SQLITE_DONE) {
+                    throw std::runtime_error(sqlite3_errmsg(db));
+                }
+                sqlite3_reset(insertOccurrence);
+                sqlite3_clear_bindings(insertOccurrence);
+            }
+            ++createdClusters;
         }
 
-        sqlite3_close(db);
+        sqlite3_finalize(insertCluster);
+        sqlite3_finalize(insertOccurrence);
+        insertCluster = nullptr;
+        insertOccurrence = nullptr;
+        execute("COMMIT;");
 
-        std::cout << "Database successfully created!\n";
-        return 0;
+        std::cout << "Geometric clusters created: " << createdClusters << '\n';
 
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << '\n';
-        return 1;
+    } catch (...) {
+        sqlite3_finalize(insertCluster);
+        sqlite3_finalize(insertOccurrence);
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        throw;
     }
 }
 
 
+void buildEdgeMapIndex(sqlite3* db) {
+
+    const char* sql = R"SQL(
+
+        INSERT OR IGNORE INTO edge_maps (
+            meshID,
+            imageID
+        )
+        SELECT DISTINCT
+            meshID,
+            imageID
+        FROM paths;
+
+        UPDATE edge_maps
+        SET componentCount = (
+            SELECT COUNT(DISTINCT componentID)
+            FROM paths
+            WHERE paths.meshID = edge_maps.meshID
+              AND paths.imageID = edge_maps.imageID
+        );
+
+        UPDATE edge_maps
+        SET pathCount = (
+            SELECT COUNT(*)
+            FROM paths
+            WHERE paths.meshID = edge_maps.meshID
+              AND paths.imageID = edge_maps.imageID
+        );
+
+        DELETE FROM edge_map_features;
+
+        -- Count individual geometric tokens.
+        INSERT INTO edge_map_features (
+            edgeMapID,
+            featureType,
+            featureID,
+            frequency
+        )
+        SELECT
+            em.edgeMapID,
+            'token',
+            pf.tokenID,
+            COUNT(*)
+
+        FROM edge_maps em
+
+        JOIN paths p
+            ON p.meshID = em.meshID
+           AND p.imageID = em.imageID
+
+        JOIN path_functions pf
+            ON pf.pathKey = p.pathKey
+
+        GROUP BY
+            em.edgeMapID,
+            pf.tokenID;
+
+        -- Count connected geometric clusters.
+        INSERT INTO edge_map_features (
+            edgeMapID,
+            featureType,
+            featureID,
+            frequency
+        )
+        SELECT
+            em.edgeMapID,
+            'cluster',
+            co.clusterID,
+            COUNT(*)
+
+        FROM edge_maps em
+
+        JOIN paths p
+            ON p.meshID = em.meshID
+           AND p.imageID = em.imageID
+
+        JOIN cluster_occurrences co
+            ON co.pathKey = p.pathKey
+
+        GROUP BY
+            em.edgeMapID,
+            co.clusterID;
+
+    )SQL";
+
+    char* error = nullptr;
+
+    int result = sqlite3_exec(
+        db,
+        sql,
+        nullptr,
+        nullptr,
+        &error
+    );
+
+    if (result != SQLITE_OK) {
+        std::string message =
+            error ? error : "SQLite error";
+
+        sqlite3_free(error);
+        throw std::runtime_error(message);
+    }
+
+    std::cout << "Edge-map feature index built.\n";
+}
+
+
+
+
+
+using FeatureKey = std::pair<std::string, int>;
+using FeatureCounts = std::map<FeatureKey, int>;
+
+// Load the existing token vocabulary.
+// Never insert new tokens while classifying an input.
+std::vector<functionPattern> loadTokenVocabulary(sqlite3* db) {
+    std::vector<functionPattern> patterns;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql =
+        "SELECT tokenID, type, descriptor "
+        "FROM tokens WHERE type IN ('line', 'bezier');";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr)
+        != SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(db));
+
+    try {
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            functionPattern pattern;
+            pattern.patternID = sqlite3_column_int(stmt, 0);
+
+            const char* type = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, 1));
+            const char* desc = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, 2));
+
+            pattern.type = type;
+            pattern.descriptor =
+                json::parse(desc).get<std::vector<double>>();
+
+            patterns.push_back(std::move(pattern));
+        }
+
+        if (rc != SQLITE_DONE)
+            throw std::runtime_error(sqlite3_errmsg(db));
+    } catch (...) {
+        sqlite3_finalize(stmt);
+        throw;
+    }
+
+    sqlite3_finalize(stmt);
+    return patterns;
+}
+
+// Find the closest existing geometric token.
+int lookupToken(
+    const std::string& type,
+    const std::vector<double>& descriptor,
+    const std::vector<functionPattern>& vocabulary
+) {
+    int bestID = -1;
+    double bestDistance = std::numeric_limits<double>::infinity();
+
+    for (const auto& pattern : vocabulary) {
+        if (pattern.type != type)
+            continue;
+
+        bool valid = false;
+
+        if (type == "line")
+            valid = matchLinear(
+                descriptor, pattern.descriptor, 10.0, 0.10);
+
+        else if (type == "bezier")
+            valid = descriptorDistance(
+                descriptor, pattern.descriptor) <= 0.05;
+
+        if (!valid)
+            continue;
+
+        double distance =
+            descriptorDistance(descriptor, pattern.descriptor);
+
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestID = pattern.patternID;
+        }
+    }
+
+    return bestID;
+}
+
+// Read the recurring structural patterns.
+std::map<std::vector<int>, int> loadClusterVocabulary(
+    sqlite3* db
+) {
+    std::map<std::vector<int>, int> clusters;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql =
+        "SELECT clusterID, tokenSequence FROM function_clusters;";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr)
+        != SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(db));
+
+    try {
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int id = sqlite3_column_int(stmt, 0);
+            const char* value = reinterpret_cast<const char*>(
+                sqlite3_column_text(stmt, 1));
+
+            clusters[json::parse(value)
+                .get<std::vector<int>>()] = id;
+        }
+
+        if (rc != SQLITE_DONE)
+            throw std::runtime_error(sqlite3_errmsg(db));
+    } catch (...) {
+        sqlite3_finalize(stmt);
+        throw;
+    }
+
+    sqlite3_finalize(stmt);
+    return clusters;
+}
+
+// Convert an input edge map into the same features
+// stored in edge_map_features.
+FeatureCounts encodeInputFeatures(
+    const json& input,
+    const std::vector<functionPattern>& vocabulary,
+    const std::map<std::vector<int>, int>& clusters
+) {
+    FeatureCounts features;
+
+    double diagonal = std::hypot(
+        input.at("width").get<double>(),
+        input.at("height").get<double>());
+
+    for (const auto& path : input.at("piecewisePaths")) {
+        std::vector<int> tokens;
+
+        for (const auto& segment : path.at("segments")) {
+            std::string type =
+                segment.at("type").get<std::string>();
+
+            auto descriptor = createDescriptor(
+                type, segment.at("data"), diagonal);
+
+            int tokenID = lookupToken(
+                type, descriptor, vocabulary);
+
+            tokens.push_back(tokenID);
+
+            if (tokenID >= 0)
+                features[{"token", tokenID}]++;
+        }
+
+        // Match consecutive sequences of 2 to 5 tokens.
+        for (size_t start = 0; start < tokens.size(); ++start) {
+            std::vector<int> sequence;
+
+            for (size_t length = 1;
+                 length <= 5 && start + length <= tokens.size();
+                 ++length) {
+
+                int id = tokens[start + length - 1];
+
+                // Unknown tokens break a connected sequence.
+                if (id < 0)
+                    break;
+
+                sequence.push_back(id);
+
+                if (length < 2)
+                    continue;
+
+                auto it = clusters.find(sequence);
+
+                if (it != clusters.end())
+                    features[{"cluster", it->second}]++;
+            }
+        }
+    }
+
+    return features;
+}
+
+// Compare an input against the indexed reference edge maps.
+std::vector<EdgeMapCandidate> matchEdgeMaps(
+    sqlite3* db,
+    const json& input,
+    size_t topK = 10,
+    const std::string& excludeMeshID = "",
+    const std::string& excludeImageID = ""
+) {
+    auto vocabulary = loadTokenVocabulary(db);
+    auto clusters = loadClusterVocabulary(db);
+
+    FeatureCounts inputFeatures =
+        encodeInputFeatures(input, vocabulary, clusters);
+    
+    int tokenCount = 0;
+    int clusterCount = 0;
+
+    for (const auto& [key, frequency] : inputFeatures) {
+        if (key.first == "token")
+            tokenCount += frequency;
+
+        else if (key.first == "cluster")
+            clusterCount += frequency;
+    }
+
+    std::cout << "Input tokens: " << tokenCount << '\n';
+    std::cout << "Input cluster occurrences: " << clusterCount << '\n';
+
+
+    bool hasInputClusters = false;
+
+    for (const auto& [key, frequency] : inputFeatures) {
+        if (key.first == "cluster" && frequency > 0) {
+            hasInputClusters = true;
+            break;
+        }
+    }
+
+    std::cout << "Input cluster features: "
+            << (hasInputClusters ? "Yes" : "No")
+            << '\n';
+
+    std::vector<EdgeMapCandidate> results;
+
+    if (inputFeatures.empty())
+        return results;
+
+    // Temporary per-query index. The reference database
+    // remains unchanged.
+    char* error = nullptr;
+
+    auto execute = [&](const char* sql) {
+        if (sqlite3_exec(db, sql, nullptr, nullptr, &error)
+            != SQLITE_OK) {
+            std::string message =
+                error ? error : "SQLite error";
+            sqlite3_free(error);
+            error = nullptr;
+            throw std::runtime_error(message);
+        }
+    };
+
+    execute(R"SQL(
+        CREATE TEMP TABLE IF NOT EXISTS input_features (
+            featureType TEXT NOT NULL,
+            featureID INTEGER NOT NULL,
+            frequency INTEGER NOT NULL,
+            PRIMARY KEY(featureType, featureID)
+        );
+        DELETE FROM input_features;
+    )SQL");
+
+    sqlite3_stmt* insert = nullptr;
+
+    const char* insertSQL = R"SQL(
+        INSERT INTO input_features
+            (featureType, featureID, frequency)
+        VALUES (?, ?, ?);
+    )SQL";
+
+    if (sqlite3_prepare_v2(db, insertSQL, -1, &insert, nullptr)
+        != SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(db));
+
+    try {
+        for (const auto& [key, count] : inputFeatures) {
+            sqlite3_bind_text(
+                insert, 1, key.first.c_str(),
+                -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(insert, 2, key.second);
+            sqlite3_bind_int(insert, 3, count);
+
+            if (sqlite3_step(insert) != SQLITE_DONE)
+                throw std::runtime_error(sqlite3_errmsg(db));
+
+            sqlite3_reset(insert);
+            sqlite3_clear_bindings(insert);
+        }
+    } catch (...) {
+        sqlite3_finalize(insert);
+        throw;
+    }
+
+    sqlite3_finalize(insert);
+
+    // Use the inverted feature index to find candidates.
+    // Calculate weighted Jaccard for each feature type.
+    const char* matchSQL = R"SQL(
+
+        
+
+
+        WITH candidate_maps AS (
+            SELECT DISTINCT ef.edgeMapID
+            FROM edge_map_features ef
+            JOIN input_features i
+              ON i.featureType = ef.featureType
+             AND i.featureID = ef.featureID
+        ),
+        totals AS (
+            SELECT
+                featureType,
+                SUM(frequency) AS total
+            FROM input_features
+            GROUP BY featureType
+        ),
+        reference_totals AS (
+            SELECT
+                ef.edgeMapID,
+                ef.featureType,
+                SUM(ef.frequency) AS total
+            FROM edge_map_features ef
+            JOIN candidate_maps cm
+              ON cm.edgeMapID = ef.edgeMapID
+            GROUP BY ef.edgeMapID, ef.featureType
+        ),
+        intersections AS (
+            SELECT
+                ef.edgeMapID,
+                ef.featureType,
+                SUM(MIN(ef.frequency, i.frequency)) AS overlap
+            FROM edge_map_features ef
+            JOIN input_features i
+              ON i.featureType = ef.featureType
+             AND i.featureID = ef.featureID
+            GROUP BY ef.edgeMapID, ef.featureType
+        ),
+        similarities AS (
+            SELECT
+                cm.edgeMapID,
+                typ.featureType,
+                CASE
+                    WHEN COALESCE(t.total, 0)
+                       + COALESCE(r.total, 0)
+                       - COALESCE(x.overlap, 0) = 0
+                    THEN 0.0
+                    ELSE
+                        1.0 * COALESCE(x.overlap, 0) /
+                        (
+                            COALESCE(t.total, 0)
+                          + COALESCE(r.total, 0)
+                          - COALESCE(x.overlap, 0)
+                        )
+                END AS similarity
+            FROM candidate_maps cm
+            CROSS JOIN (
+                SELECT 'token' AS featureType
+                UNION ALL
+                SELECT 'cluster'
+            ) typ
+            LEFT JOIN totals t
+              ON t.featureType = typ.featureType
+            LEFT JOIN reference_totals r
+              ON r.edgeMapID = cm.edgeMapID
+             AND r.featureType = typ.featureType
+            LEFT JOIN intersections x
+              ON x.edgeMapID = cm.edgeMapID
+             AND x.featureType = typ.featureType
+        )
+        SELECT
+            em.edgeMapID,
+            em.meshID,
+            em.imageID,
+            MAX(CASE WHEN s.featureType = 'token'
+                     THEN s.similarity ELSE 0 END),
+            MAX(CASE WHEN s.featureType = 'cluster'
+                     THEN s.similarity ELSE 0 END)
+        FROM similarities s
+        JOIN edge_maps em
+          ON em.edgeMapID = s.edgeMapID
+        GROUP BY em.edgeMapID, em.meshID, em.imageID;
+    )SQL";
+
+    sqlite3_stmt* stmt = nullptr;
+
+    if (sqlite3_prepare_v2(db, matchSQL, -1, &stmt, nullptr)
+        != SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(db));
+
+    try {
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            EdgeMapCandidate candidate;
+
+            candidate.edgeMapID = sqlite3_column_int(stmt, 0);
+
+            candidate.meshID =
+                reinterpret_cast<const char*>(
+                    sqlite3_column_text(stmt, 1));
+
+            candidate.imageID =
+                reinterpret_cast<const char*>(
+                    sqlite3_column_text(stmt, 2));
+
+            candidate.tokenSimilarity =
+                sqlite3_column_double(stmt, 3);
+
+            candidate.clusterSimilarity =
+                sqlite3_column_double(stmt, 4);
+
+            if (hasInputClusters) {
+                candidate.score =
+                    0.30 * candidate.tokenSimilarity +
+                    0.70 * candidate.clusterSimilarity;
+            } else {
+                candidate.score = candidate.tokenSimilarity;
+            }
+
+            results.push_back(std::move(candidate));
+        }
+
+        if (rc != SQLITE_DONE)
+            throw std::runtime_error(sqlite3_errmsg(db));
+
+    } catch (...) {
+        sqlite3_finalize(stmt);
+        throw;
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (!excludeMeshID.empty() && !excludeImageID.empty()) {
+        results.erase(
+            std::remove_if(
+                results.begin(),
+                results.end(),
+                [&](const EdgeMapCandidate& candidate) {
+                    return candidate.meshID == excludeMeshID &&
+                        candidate.imageID == excludeImageID;
+                }
+            ),
+            results.end()
+        );
+    }
+
+    std::sort(results.begin(), results.end(),
+        [](const EdgeMapCandidate& a,
+           const EdgeMapCandidate& b) {
+            if (a.score != b.score)
+                return a.score > b.score;
+            return a.edgeMapID < b.edgeMapID;
+        });
+
+    if (results.size() > topK)
+        results.resize(topK);
+
+    return results;
+}
+
+
+
+
+
+int main(int argc, char* argv[]) {
+
+    const fs::path datasetRoot =
+        R"(F:\CARLA set\sets\test_edges)";
+
+    const fs::path databasePath =
+        R"(F:\CARLA set\model\tokens.db)";
+
+    // ==========================================
+    // MODE 1: BUILD REFERENCE DATABASE
+    // ==========================================
+
+    if (argc > 1 &&
+        std::string(argv[1]) == "--build-database") {
+
+        try {
+            std::cout << "Loading dataset edges...\n";
+
+            auto functions = loadDatasetEdges(datasetRoot);
+
+            std::cout << "Functions loaded: "
+                      << functions.size() << '\n';
+
+            sqlite3* db = openDatabase(databasePath.string());
+
+            try {
+                std::cout << "Tokenizing functions...\n";
+
+                auto dataset = tokenizeFunctions(db, functions);
+
+                std::cout << "Unique tokens: "
+                          << dataset.patterns.size() << '\n';
+
+                saveTokenDataset(db, dataset, functions);
+
+                std::cout << "Building composite tokens...\n";
+                mergeTokens(db, 2);
+                encodeCompositeTokens(db);
+
+                std::cout << "Building token connectivity...\n";
+                objectLookup(db);
+
+                std::cout << "Grouping connected functions...\n";
+                groupConnectedNeighbors(db, 1, 5);
+
+                std::cout << "Building edge-map index...\n";
+                buildEdgeMapIndex(db);
+
+            } catch (...) {
+                sqlite3_close(db);
+                throw;
+            }
+
+            sqlite3_close(db);
+
+            std::cout << "Database successfully created!\n";
+            return 0;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Database error: "
+                      << e.what() << '\n';
+            return 1;
+        }
+    }
+
+    // ==========================================
+    // MODE 2: CLASSIFY INPUT IMAGE
+    // ==========================================
 
     std::string imagePath;
     std::string outputPath;
 
     for (int i = 1; i < argc; ++i) {
+
         std::string arg = argv[i];
 
         if (arg == "--input" && i + 1 < argc) {
@@ -1789,36 +2710,93 @@ if (argc > 1 && std::string(argv[1]) == "--build-database") {
 
     if (imagePath.empty() || outputPath.empty()) {
         std::cerr
-            << "Usage: classifier.exe --input IMAGE --output JSON\n";
+            << "Usage:\n"
+            << "  classifier.exe --build-database\n"
+            << "  classifier.exe --input IMAGE --output JSON\n";
+
         return 1;
     }
 
-    json input = encodeImage(imagePath);
+    try {
+        // Step 1: Encode input image.
+        std::cout << "Encoding input image...\n";
 
-    std::string datasetRoot =
-        R"(F:\CARLA set\sets\test_edges)";
+        json input = encodeImage(imagePath);
 
-    TokenDataset dataset = vectorizeToken(datasetRoot);
+        // Step 2: Open reference database.
+        sqlite3* db = openDatabase(databasePath.string());
 
-    std::vector<matchCandidate> candidates = match(
-        input,
-        dataset.patterns,
-        dataset.paths
-    );
+        std::vector<EdgeMapCandidate> candidates;
 
-    std::vector<PointMatch> selected = findPoints(
-        input,
-        dataset,
-        candidates
-    );
+        try {
+            // Step 3: Find similar reference edge maps.
+            std::cout << "Matching reference edge maps...\n";
 
-    exportPointMatches(selected, outputPath);
+            candidates = matchEdgeMaps(db, input, 10);
 
-    std::cout << "Matched functions: "
-              << selected.size() << std::endl;
+        } catch (...) {
+            sqlite3_close(db);
+            throw;
+        }
 
-    std::cout << "Exported matches to: "
-              << outputPath << std::endl;
+        sqlite3_close(db);
 
-    return 0;
+        // Step 4: Create JSON output for Python.
+        json output;
+
+        output["inputImage"] = imagePath;
+        output["candidateCount"] = candidates.size();
+        output["candidates"] = json::array();
+
+        for (const auto& candidate : candidates) {
+
+            output["candidates"].push_back({
+                {"meshID", candidate.meshID},
+                {"imageID", candidate.imageID},
+                {"edgeMapID", candidate.edgeMapID},
+                {"score", candidate.score},
+                {"tokenSimilarity", candidate.tokenSimilarity},
+                {"clusterSimilarity", candidate.clusterSimilarity}
+            });
+        }
+
+        // Step 5: Save results.
+        std::ofstream file(outputPath);
+
+        if (!file) {
+            throw std::runtime_error(
+                "Unable to open classification output file"
+            );
+        }
+
+        file << output.dump(2);
+        file.close();
+
+        // Step 6: Print results for debugging.
+        std::cout << "\nClassification results:\n";
+
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto& candidate = candidates[i];
+
+            std::cout
+                << i + 1
+                << ". Mesh: " << candidate.meshID
+                << " | Image: " << candidate.imageID
+                << " | Score: " << candidate.score
+                << " | Tokens: " << candidate.tokenSimilarity
+                << " | Clusters: " << candidate.clusterSimilarity
+                << '\n';
+        }
+
+        std::cout
+            << "\nResults exported to: "
+            << outputPath << '\n';
+
+        return 0;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Classification error: "
+                  << e.what() << '\n';
+        return 1;
+    }
 }
