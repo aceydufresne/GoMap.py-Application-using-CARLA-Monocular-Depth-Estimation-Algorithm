@@ -1,348 +1,164 @@
 #print("Testing")
-import bpy
-import numpy as np
-import argparse
+import importlib.util
 import json
-import sys
-
 from pathlib import Path
+import bpy
 from mathutils import Vector
+import bpy
 
 
-def get_scene_meshes():
-    return [
-        obj for obj in bpy.context.scene.objects
-        if obj.type == "MESH"
+#recreate the blender virtual scene from the dataset
+def recreate_reference_scene(edge_json_path, carla_root=r"F:\CARLA"):
+    root = Path(carla_root)
+    edge = json.loads(Path(edge_json_path).read_text(encoding="utf-8-sig"))
+
+    mesh_id = edge["meshID"]
+    view = int(edge["imageID"])
+    width, height = edge["width"], edge["height"]
+    if width <= 0 or width != height:
+        raise ValueError("The CARLA multiview renderer expects a square image.")
+
+    manifest_path = root / "sets" / "pointr_multiview" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    view_count = int(manifest["configuration"]["views"])
+    if not 0 <= view < view_count:
+        raise ValueError(f"View {view} is outside the dataset's view range.")
+
+    source = edge.get("source")
+    matches = [
+        row for row in manifest["examples"]
+        if row["mesh_id"] == mesh_id
+        and int(row["view"]) == view
+        and (source is None or row["source"] == source)
     ]
-
-
-def normalize_scene():
-    meshes = get_scene_meshes()
-
-    if not meshes:
-        raise ValueError("No mesh objects found!")
-
-    # Match original renderer's root-parent normalization
-    roots = [obj for obj in bpy.context.scene.objects
-             if obj.parent is None]
-
-    if len(roots) > 1:
-        parent = bpy.data.objects.new("ParentEmpty", None)
-        bpy.context.scene.collection.objects.link(parent)
-
-        for obj in roots:
-            if obj != parent:
-                obj.parent = parent
-
-    bpy.context.view_layer.update()
-
-    def bounds():
-        coords = [
-            obj.matrix_world @ Vector(corner)
-            for obj in meshes
-            for corner in obj.bound_box
-        ]
-        return (
-            Vector(tuple(min(p[i] for p in coords) for i in range(3))),
-            Vector(tuple(max(p[i] for p in coords) for i in range(3)))
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one manifest entry for mesh {mesh_id}, view {view}. "
+            f"Found {len(matches)}."
         )
 
-    bbox_min, bbox_max = bounds()
+    scripts = root / "model" / "pointr++"
 
-    scale = 1.0 / max(bbox_max - bbox_min)
+    def load_module(filename):
+        path = scripts / filename
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
-    for obj in bpy.context.scene.objects:
-        if obj.parent is None:
-            obj.scale *= scale
+    generator = load_module("carla_build_multiview.py")
+    renderer = load_module("render_mobilenet_views.py")
 
+    mesh_path = next(
+        (path for _, path in generator.discover(root, matches[0]["source"])
+         if path.stem == mesh_id),
+        None,
+    )
+    if mesh_path is None:
+        raise FileNotFoundError(f"Source mesh {mesh_id} was not found under {root}.")
+
+    generator.reset_scene()
+    generator.import_mesh(mesh_path)
+    generator.normalize_scene()
+
+    renderer.configure_render(width)
+    direction = generator.view_direction(view, view_count)
+    renderer.make_camera(direction, width)
     bpy.context.view_layer.update()
 
-    bbox_min, bbox_max = bounds()
-    offset = -(bbox_min + bbox_max) / 2.0
-
-    for obj in bpy.context.scene.objects:
-        if obj.parent is None:
-            obj.matrix_world.translation += offset
-
-    bpy.context.view_layer.update()
+    return bpy.context.scene, edge
 
 
+#ray from edge map pixel directly to mesh to find distance
+def raycast_function_pixels(scene, edge):
+    """Raycast the saved edge pixels and return per-function depth and XYZ."""
+    if scene != bpy.context.scene:
+        raise ValueError("The recreated scene must be Blender's active scene.")
 
+    camera = scene.camera
+    if camera is None or camera.data.type != "ORTHO":
+        raise ValueError("This function requires an orthographic camera.")
 
-def raycastEdges(pixel_coordinates, camera_path, width=512, height=512):
-    
-    RT = np.load(camera_path)
-    print(f"Camera matrix shape: {RT.shape}", flush=True)
+    width, height = edge["width"], edge["height"]
+    if width <= 0 or height <= 0:
+        raise ValueError("Image width and height must be positive.")
 
-    if RT.shape not in [(3, 4), (4, 4)]:
-        raise ValueError(f"Unexpected camera matrix shape: {RT.shape}")
+    # Camera-local bounds of the image plane.
+    frame = camera.data.view_frame(scene=scene)
+    left = min(corner.x for corner in frame)
+    right = max(corner.x for corner in frame)
+    bottom = min(corner.y for corner in frame)
+    top = max(corner.y for corner in frame)
 
-    R = RT[:3, :3]
-    T = RT[:3, 3]
-
-    camera_origin = -R.T @ T
-    
-    camera_forward = R.T @ np.array([0.0, 0.0, -1.0])
-
-    print("Camera origin:", camera_origin)
-    print("Camera forward:", camera_forward)
-
-    focal_length = 35.0
-    sensor_width = 32.0
-
-    fx = width * focal_length / sensor_width
-    fy = fx
-
-    cx = width / 2.0
-    cy = height / 2.0
-
-    scene = bpy.context.scene
+    transform = camera.matrix_world.copy()
+    camera_position = transform.translation
+    forward = (transform.to_3x3() @ Vector((0, 0, -1))).normalized()
+    near = camera.data.clip_start
+    max_distance = camera.data.clip_end - near
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    
-    
-    origin = Vector(camera_origin.tolist())
-    forward = Vector(camera_forward.tolist())
 
-    hit, location, normal, face_index, obj, matrix = scene.ray_cast(
-        depsgraph,
-        origin,
-        forward,
-        distance=1000.0
-    )
+    # Cache successful hits and misses across all segments in this view.
+    pixel_hits = {}
 
-    print("Center ray hit:", hit)
+    def cast_pixel(x, y):
+        if not (0 <= x < width and 0 <= y < height):
+            raise ValueError(f"Pixel {(x, y)} is outside the {width}x{height} image.")
 
-    if hit:
-        print("Center intersection:", location)
-        print("Hit object:", obj.name)
+        pixel = (x, y)
+        if pixel in pixel_hits:
+            return pixel_hits[pixel]
 
-    grid_hits = 0
-    grid_total = 0
+        # Edge pixels use a top-left origin. Sample the center of each pixel.
+        u = (x + 0.5) / width
+        v = (y + 0.5) / height
+        origin = transform @ Vector((
+            left + u * (right - left),
+            top - v * (top - bottom),
+            -near,
+        ))
 
-    for y in range(0, height, 16):
-        for x in range(0, width, 16):
-            direction_camera = np.array([
-                (x + 0.5 - cx) / fx,
-                -(y + 0.5 - cy) / fy,
-                -1.0
-            ])
+        hit, location, normal, face_index, obj, _ = scene.ray_cast(
+            depsgraph, origin, forward, distance=max_distance
+        )
 
-            direction_camera /= np.linalg.norm(direction_camera)
-
-            direction_world = R.T @ direction_camera
-            direction_world /= np.linalg.norm(direction_world)
-
-            direction = Vector(direction_world.tolist())
-
-            hit, *_ = scene.ray_cast(
-                depsgraph,
-                origin,
-                direction,
-                distance=1000.0
-            )
-
-            grid_total += 1
-            if hit:
-                grid_hits += 1
-
-    print(
-        f"Image grid coverage: {grid_hits}/{grid_total} "
-        f"({100 * grid_hits / grid_total:.2f}%)"
-    )
-
-
-    points = []
-    misses = 0
-    for x, y in pixel_coordinates:
-        direction_camera = np.array([(x + 0.5 - cx) / fx,-(y + 0.5 - cy) / fy,-1.0])
-        direction_camera /= np.linalg.norm(direction_camera)
-
-        direction_world = R.T @ direction_camera
-        direction_world /= np.linalg.norm(direction_world)
-
-        
-        direction = Vector(direction_world.tolist())
-
-        hit, location, normal, face_index, obj, matrix = (scene.ray_cast(depsgraph, origin, direction, distance=1000.0))
-
-        if hit:
-            points.append({
-                "pixel": [int(x), int(y)],
-                "xyz": [float(v) for v in location],
+        result = None
+        if hit and obj is not None:
+            result = {
+                "pixel": [x, y],
+                "depth": float((location - camera_position).dot(forward)),
+                "xyz": list(location),
+                "normal": list(normal),
                 "object": obj.name,
-                "face_index": face_index
+                "faceIndex": face_index,
+            }
+
+        pixel_hits[pixel] = result
+        return result
+
+    functions = []
+    for path in edge["piecewisePaths"]:
+        for sequence_index, segment in enumerate(path["segments"]):
+            data = segment["data"]
+            pixels = data["pixels"]
+            samples = [cast_pixel(x, y) for x, y in pixels]
+            points = [sample for sample in samples if sample is not None]
+
+            functions.append({
+                "meshID": edge["meshID"],
+                "imageID": edge["imageID"],
+                "componentID": path["edgeID"],
+                "pathID": path["pathID"],
+                "sequenceIndex": sequence_index,
+                "functionID": data["id"],
+                "type": segment["type"],
+                "pixelCount": len(pixels),
+                "hitCount": len(points),
+                "pixels": pixels,
+                "depths": [
+                    sample["depth"] if sample is not None else None
+                    for sample in samples
+                ],
+                "points": points,
             })
-        else:
-            misses += 1
-            
-    print(f"Raycast hits: {len(points)}", flush=True)
-    print(f"Raycast misses: {misses}", flush=True)
-    print(
-        f"Hit rate: {100 * len(points) / max(1, len(pixel_coordinates)):.2f}%",
-        flush=True
-    )
-            
-    return points
 
-
-
-def createRaycastMask(camera_path, width=512, height=512):
-    RT = np.load(camera_path)
-
-    R = RT[:3, :3]
-    T = RT[:3, 3]
-
-    camera_origin = -R.T @ T
-
-    focal_length = 35.0
-    sensor_width = 32.0
-
-    fx = width * focal_length / sensor_width
-    fy = fx
-
-    cx = width / 2.0
-    cy = height / 2.0
-
-    scene = bpy.context.scene
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-
-    origin = Vector(camera_origin.tolist())
-
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    for y in range(height):
-        for x in range(width):
-            direction_camera = np.array([
-                (x + 0.5 - cx) / fx,
-                -(y + 0.5 - cy) / fy,
-                -1.0
-            ])
-
-            direction_camera /= np.linalg.norm(direction_camera)
-
-            direction_world = R.T @ direction_camera
-            direction_world /= np.linalg.norm(direction_world)
-
-            direction = Vector(direction_world.tolist())
-
-            hit, *_ = scene.ray_cast(
-                depsgraph,
-                origin,
-                direction,
-                distance=1000.0
-            )
-
-            if hit:
-                mask[y, x] = 255
-
-    return mask
-
-
-
-
-def main():
-    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--matches", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--camera", required=True)
-    parser.add_argument("--mesh", required=True)
-
-    args = parser.parse_args(argv)
-
-    # 1. Load edgeEncoder JSON
-    with open(args.matches, "r", encoding="utf-8") as file:
-        data = json.load(file)
-
-    graphs = data["graphs"]
-
-    pixel_coordinates = []
-    pixel_components = {}
-
-    for graph in graphs:
-        component_id = graph["componentID"]
-
-        for node in graph["nodes"]:
-            pixel = tuple(node["pixel"])
-            pixel_coordinates.append(pixel)
-            pixel_components[pixel] = component_id
-
-    pixel_coordinates = list(dict.fromkeys(pixel_coordinates))
-    if not pixel_coordinates:
-        raise ValueError("No edge pixels found in JSON!")
-
-    print(f"Loaded {len(graphs)} components")
-    print(f"Collected {len(pixel_coordinates)} unique edge pixels")
-
-    # 2. Load original mesh
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.object.delete(use_global=False)
-
-    if args.mesh.lower().endswith(".fbx"):
-        bpy.ops.import_scene.fbx(filepath=args.mesh)
-    elif args.mesh.lower().endswith((".glb", ".gltf")):
-        bpy.ops.import_scene.gltf(filepath=args.mesh, merge_vertices=True)
-    else:
-        raise ValueError(f"Unsupported mesh format: {args.mesh}")
-
-    normalize_scene()
-    
-    
-    mask = createRaycastMask(args.camera)
-
-    mask_path = r"F:\CARLA set\model\raycast_mask.png"
-
-    # Save the mask using Blender's image API
-    image = bpy.data.images.new(
-        "RaycastMask",
-        width=512,
-        height=512,
-        alpha=True
-    )
-
-    rgba = np.ones((512, 512, 4), dtype=np.float32)
-    rgba[:, :, :3] = mask[:, :, None] / 255.0
-    rgba[:, :, 3] = 1.0
-
-    # Blender's image buffer is bottom-up
-    rgba = np.flipud(rgba)
-
-    image.pixels.foreach_set(rgba.ravel())
-    image.filepath_raw = mask_path
-    image.file_format = "PNG"
-    image.save()
-
-    print(f"Saved raycast mask to {mask_path}")
-    
-
-    print("Original mesh imported and normalized.", flush=True)
-
-    # 3. Project pixels onto mesh
-    points = raycastEdges(
-        pixel_coordinates,
-        args.camera
-    )
-    for point in points:
-        pixel = tuple(point["pixel"])
-        point["componentID"] = pixel_components.get(pixel, -1)
-
-    # 4. Save results
-    result = {
-        "components": len(graphs),
-        "pixelsProcessed": len(pixel_coordinates),
-        "pointsFound": len(points),
-        "points": points
-    }
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, "w", encoding="utf-8") as file:
-        json.dump(result, file, indent=4)
-
-    print(f"Saved {len(points)} 3D points to {output_path}", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+    return functions
