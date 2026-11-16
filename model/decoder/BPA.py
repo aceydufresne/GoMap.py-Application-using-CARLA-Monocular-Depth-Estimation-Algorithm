@@ -35,7 +35,7 @@ def loadCloud():
         #find the spacing between vectors
         distances = np.asarray(pcd.compute_nearest_neighbor_distance())
         avg = np.mean(distances)
-        radii = [avg * 1.5, avg * 2.0, avg * 3.0, avg * 4.0]
+        radii = [avg * 2.0, avg * 4.0, avg * 8.0, avg * 12.0]
         print("points:", len(pcd.points))
         print("average spacing:", avg)
         print("radius:", radii)
