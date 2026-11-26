@@ -1,2802 +1,1958 @@
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
-#include <algorithm>
+#include <limits>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <cmath>
-#include <nlohmann/json.hpp>
-#include <limits>
-#include <sqlite3.h>
-#include "edgeEncoder.h"
-#include <stdexcept>
-#include <map>
 #include <utility>
-#include <set>
-#include <tuple>
+#include <nlohmann/json.hpp>
+#include <sqlite3.h>
+#include <opencv2/core.hpp>
+#include "edgeEncoder.h"
 
-namespace fs = std::filesystem;
-using json = nlohmann::json;
-//error with imports
-constexpr double PI = 3.14159265358979323846;
+nlohmann::json encodeImage(const std::string& imagePath);
 
-//struct for the bucket system look-up table
-struct FeatureIndex {
-    std::unordered_map<int, std::vector<int>> components;
-    std::unordered_map<int, std::vector<int>> endpoints;
-    std::unordered_map<int, std::vector<int>> junctions;
-    std::unordered_map<int, std::vector<int>> loops;
-    std::unordered_map<int, std::vector<int>> contourLength;
-    std::unordered_map<int, std::vector<int>> enclosedArea;
+constexpr double angleBucketWidth = 10.0;
+constexpr int angleBucketCount = 18;
+constexpr double lengthBucketWidth = 0.01;
+constexpr double lengthTolerance = 0.10;
+constexpr double neighborTolerancePixels = 5.0;
+
+struct PathToken {
+    int tokenID;
+    int functionID;
+};
+
+struct LineDescriptor {
+    double angleDegrees;
+    double normalizedLength;
+};
+
+struct LineBucketRange {
+    std::array<int, 3> angles;
+    int minLength;
+    int maxLength;
+};
+
+LineBucketRange lineBucketRange(const LineDescriptor& input) {
+    const int center = static_cast<int>(input.angleDegrees / angleBucketWidth);
+    const double shortest = input.normalizedLength * (1.0 - lengthTolerance);
+    const double longest = input.normalizedLength / (1.0 - lengthTolerance);
+    return {
+        {(center + angleBucketCount - 1) % angleBucketCount,
+         center, (center + 1) % angleBucketCount},
+        static_cast<int>(shortest / lengthBucketWidth),
+        static_cast<int>(longest / lengthBucketWidth)
+    };
+}
+
+struct LineDifference {
+    double angle;
+    double length;
 };
 
 
-struct TokenMerge {
-    int firstToken;
-    int secondToken;
-    int frequency;
+struct LineSegment {
+    cv::Point2d start;
+    cv::Point2d end;
+    std::optional<cv::Point2d> control;
+
+    cv::Point2d pointAt(double t) const {
+        if (control)
+            return (1.0 - t) * (1.0 - t) * start
+                 + 2.0 * t * (1.0 - t) * *control + t * t * end;
+        return (1.0 - t) * start + t * end;
+    }
 };
 
+struct LineTransform {
+    double rotationRadians;
+    double scale;
+    cv::Point2d translation;
 
+    cv::Point2d apply(const cv::Point2d& p) const {
+        const double c = std::cos(rotationRadians);
+        const double s = std::sin(rotationRadians);
+        return scale * cv::Point2d(c * p.x - s * p.y, s * p.x + c * p.y)
+             + translation;
+    }
+};
 
-//to better match functions in input
+struct LineComparison {
+    LineTransform transform;
+    double substitutionCost;  // 0 = close agreement, 1 = full substitution
+};
+
+std::optional<LineDifference> compareLines(LineDescriptor a, LineDescriptor b) {
+    const double delta = std::abs(a.angleDegrees - b.angleDegrees);
+    const double angle = std::min(delta, 180.0 - delta);
+    const double length = std::abs(a.normalizedLength - b.normalizedLength)
+        / std::max(a.normalizedLength, b.normalizedLength);
+    if (angle <= angleBucketWidth && length <= lengthTolerance)
+        return LineDifference{angle, length};
+    return std::nullopt;
+}
+
 struct FunctionNeighbor {
     int functionID;
-    int patternID = -1;
-
-    //node system
-    int relativePosition;
+    int neighborID;
+    double distancePixels;
 };
 
-//keep track of functions that appear often, and their corresponding 3d data
-struct FunctionOccurrence {
-    std::string meshID;
-    std::string imageID;
 
-    int componentID;
-    int pathID;
+struct LineMatch {
+    std::string imagePath;
     int functionID;
-};
-
-struct functionPattern {
-    int patternID;
-    std::string type;
-    std::vector<double> descriptor;
-    std::vector<FunctionOccurrence> occurrences;
+    double angleDifference;
+    double relativeLengthDifference;
 };
 
 
 
-struct matchCandidate {
-    std::string meshID;
-    std::string imageID;
-
-    int matchedFunctions = 0;
-    int matchedNeighbors = 0;
-
-    double score = 0.0;
-};
-
-
-struct PathRecord {
-    std::string meshID;
-    std::string imageID;
-
-    int componentID;
-    int pathID;
-
-    std::vector<int> functionIDs;
-    std::vector<int> patternIDs;
-    std::vector<FunctionNeighbor> neighbors;
-};
-
-
-struct TokenDataset {
-    std::vector<functionPattern> patterns;
-    std::vector<PathRecord> paths;
-};
-
-//this is passed to the bpy script to create the pointcloud
-struct PointMatch {
-    int patternID = -1;
-
-    std::string meshID;
-    std::string imageID;
-
-    int componentID = -1;
-    int pathID = -1;
-    int functionID = -1;
-
-    std::string type;
-    double distance = 0.0;
-};
-
-
-
-struct EdgeFunction {
-    std::string meshID;
-    std::string imageID;
-
-    int componentID;
-    int pathID;
-    int functionID;
-    int sequenceIndex;
-
-    std::string type;
-    std::vector<double> descriptor;
-    json parameters;
-};
-
-//group functions into larger clusters
-struct FunctionCluster {
-    int clusterID = -1;
-    //not the same grouping as the components, based on recurring connectivity
-    std::vector<int> tokenIDs;
-
-    int frequency = 0;
-};
-
-
-struct EdgeMapSignature {
-    std::string meshID;
-    std::string imageID;
-
-    std::unordered_map<int, int> tokenFrequency;
-    std::unordered_map<int, int> clusterFrequency;
-
-    int componentCount = 0;
-    int pathCount = 0;
-};
-
-struct EdgeMapCandidate {
-    int edgeMapID = -1;
-
-    std::string meshID;
-    std::string imageID;
-
-    double tokenSimilarity = 0.0;
-    double clusterSimilarity = 0.0;
-    double score = 0.0;
-};
-
-std::vector<double> createDescriptor(const std::string& type, const json& function, double imageDiagonal) {
-    std::vector<double> descriptor;
-
-    if (imageDiagonal <= 0.0) {
-        return descriptor;
-    }
-    if (type == "line") {
-        const auto& start = function.at("start");
-        const auto& end = function.at("end");
-
-        double dx = end.at(0).get<double>() - start.at(0).get<double>();
-        double dy = end.at(1).get<double>() - start.at(1).get<double>();
-
-        double length = std::hypot(dx, dy);
-        double angle = std::atan2(dy, dx);
-
-        angle = std::fmod(angle + PI, PI);
-
-        descriptor = {angle / PI, length / imageDiagonal};
-    }
-
-    else if (type == "bezier") {
-        const auto& p0 = function.at("p0");
-        const auto& p1 = function.at("p1");
-        const auto& p2 = function.at("p2");
-
-        double x0 = p0.at(0).get<double>();
-        double y0 = p0.at(1).get<double>();
-
-        double x1 = p1.at(0).get<double>();
-        double y1 = p1.at(1).get<double>();
-
-        double x2 = p2.at(0).get<double>();
-        double y2 = p2.at(1).get<double>();
-
-        descriptor = {
-            (x1 - x0) / imageDiagonal,
-            (y1 - y0) / imageDiagonal,
-            (x2 - x0) / imageDiagonal,
-            (y2 - y0) / imageDiagonal
-        };
-    }
-
-    return descriptor;
+void execute(sqlite3* db, const char* sql) {
+    if (sqlite3_exec(db, sql, nullptr, nullptr, nullptr) != SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(db));
 }
 
-
-
-
-double descriptorDistance(const std::vector<double>& a, const std::vector<double>& b) {
-    if (a.size() != b.size() || a.empty())
-        return std::numeric_limits<double>::infinity();
-
-    double sum = 0.0;
-
-    for (size_t i = 0; i < a.size(); i++) {
-        double diff = a[i] - b[i];
-
-        // Circular orientation for linear functions
-        if (a.size() == 2 && i == 0)
-            diff = std::min(std::abs(diff),
-                            1.0 - std::abs(diff));
-
-        sum += diff * diff;
+class Statement {
+public:
+    Statement(sqlite3* db, const char* sql) : db_(db) {
+        sqlite3_stmt* statement = nullptr;
+        check(sqlite3_prepare_v2(db, sql, -1, &statement, nullptr), SQLITE_OK);
+        statement_.reset(statement);
     }
 
-    return std::sqrt(sum);
-}
+    sqlite3_stmt* get() const { return statement_.get(); }
 
-
-
-bool matchLinear(const std::vector<double>& a, const std::vector<double>& b, double angleThreshold, double lengthTolerance) {
-    if(a.size() != 2 || b.size() != 2){
-        return false;
+    void bind(int index, const std::string& value) {
+        check(sqlite3_bind_text(get(), index, value.c_str(), -1, SQLITE_TRANSIENT), SQLITE_OK);
     }
 
-    // Angle difference
-    double angleDiff = std::abs(a[0] - b[0]);
-    angleDiff = std::min(angleDiff, 1.0 - angleDiff);
-    double angleDegrees = angleDiff * 180.0;
-    // relative length difference
-    double maxLength = std::max(a[1], b[1]);
-
-    if(maxLength <= 0.0)
-        return false;
-    double lengthDiff = std::abs(a[1] - b[1]) / maxLength;
-
-    return angleDegrees <= angleThreshold && lengthDiff <= lengthTolerance;
-}
-
-
-
-
-
-
-TokenDataset vectorizeToken(const fs::path& datasetRoot){
-    //example output
-    fs::path outputPath = datasetRoot / "function_patterns.txt";
-    std::vector<functionPattern> patterns;
-    std::vector<PathRecord> pathRecords;
-    //traversal information
-    int nextPatternID = 0;
-    int totalImages = 0;
-    int totalFunctions = 0;
-    //judgement tolerance for angles
-    double angleThreshold = 10.0;
-    //tolernace for total arclength
-    double lengthTolerance = 0.10;
-    //traverse the meta data
-    //iterate through each json file
-    for(const auto& entry: fs::recursive_directory_iterator(datasetRoot)){
-        //handle exceptiosn
-        if(!entry.is_regular_file()){
-            continue;
-        }
-        //multiple file types in the current dataset
-        if(entry.path().extension() != ".json"){
-            continue;
-        }
-        if(entry.path().filename() == "index.json"){
-            continue;
-        }
-        std::ifstream file(entry.path());
-        if(!file){
-            continue;
-        }
-        try{
-            //begin assignement
-            json data;
-            file >> data;
-            std::string meshID = data.at("meshID").get<std::string>();
-            std::string imageID = data.at("imageID").get<std::string>();
-            double width = data.value("width", 512.0);
-            double height = data.value("height", 512.0);
-            double imageDiagonal = std::hypot(width, height);
-            const auto& piecewisePaths = data.at("piecewisePaths");
-            totalImages++;
-
-            //iterate through components
-            for(const auto& path : piecewisePaths) {
-                    //std::cout << "First pass starting\n";
-                    //collect the edgemap information
-                    int componentID = path.at("edgeID").get<int>();
-                    int pathID = path.at("pathID").get<int>();
-                    PathRecord record;
-                    record.meshID = meshID;
-                    record.imageID = imageID;
-                    record.componentID = componentID;
-                    record.pathID = pathID;
-
-                    //traverse paths
-                    for(const auto& segment: path.at("segments")){
-                        //std::cout << "second loop pass starting\n";
-                        std::string type = segment.at("type").get<std::string>();
-                        const auto& function = segment.at("data");
-                        int functionID = function.at("id").get<int>();
-                        //convert function
-                        std::vector<double> descriptor = createDescriptor(type, function, imageDiagonal);
-                        if(descriptor.empty()){
-                            continue;
-                        }
-                        totalFunctions++;
-                        //assign the found data
-                        FunctionOccurrence occurrence;
-                        occurrence.meshID = meshID;
-                        occurrence.imageID = imageID;
-                        occurrence.componentID = componentID;
-                        occurrence.pathID = pathID;
-                        occurrence.functionID = functionID;
-                        //begin the sorting process
-                        int matchedPattern = -1;
-
-                        //collected functions
-                        for(size_t i = 0; i < patterns.size(); i++){
-                            //std::cout << "259\n";
-                            if(patterns[i].type != type){
-                                continue;
-                            }
-                            bool isMatch = false;
-                            //'linear,' used as line in metadata
-                            if(type == "line"){
-                                //helper function to find relative distance between comparision functions
-                                isMatch = matchLinear(descriptor, patterns[i].descriptor, angleThreshold, lengthTolerance);
-                            }
-                            else if(type == "bezier"){
-                                //temporary helper function
-                                isMatch = descriptorDistance(descriptor, patterns[i].descriptor) < 0.05;
-                            }
-                            if(isMatch){
-                                matchedPattern = static_cast<int>(i);
-                                break;
-                            }
-                        }
-                        //now matching functions
-                        if(matchedPattern == -1){
-                            //move on
-                            functionPattern pattern;
-                            pattern.patternID = nextPatternID++;
-                            pattern.type = type;
-                            pattern.descriptor = descriptor;
-                            pattern.occurrences.push_back(occurrence);
-                            //add new function to the list
-                            patterns.push_back(std::move(pattern));
-                            matchedPattern = static_cast<int>(patterns.size()) - 1;
-
-                        }
-                        else{
-                            //we found another matching function
-                            patterns[matchedPattern].occurrences.push_back(occurrence);
-                        }
-                        record.functionIDs.push_back(functionID);
-                        record.patternIDs.push_back(patterns[matchedPattern].patternID);
-                    }
-                    pathRecords.push_back(record);
-                }
-        }catch(const std::exception& e){
-                std::cerr << "error" << entry.path() << ":" << e.what() << '\n';
-            }
+    void bind(int index, int value) {
+        check(sqlite3_bind_int(get(), index, value), SQLITE_OK);
     }
-    return {std::move(patterns), std::move(pathRecords)};
-}
 
+    void bind(int index, double value) {
+        check(sqlite3_bind_double(get(), index, value), SQLITE_OK);
+    }
+   void write() {
+        check(sqlite3_step(get()), SQLITE_DONE);
+        check(sqlite3_reset(get()), SQLITE_OK);
+        check(sqlite3_clear_bindings(get()), SQLITE_OK);
+    }
 
+    bool next() {
+        const int result = sqlite3_step(get());
+        if (result == SQLITE_DONE)
+            return false;
+        check(result, SQLITE_ROW);
+        return true;
+    }
+private:
+    void check(int result, int expected) const {
+        if (result != expected)
+            throw std::runtime_error(sqlite3_errmsg(db_));
+    }
 
-int verifyNeighbors(const PathRecord& inputPath, const PathRecord& candidatePath, int inputIndex, int candidateIndex) {
-    int matches = 0;
-    const auto& input = inputPath.patternIDs;
-    const auto& candidate = candidatePath.patternIDs;
-    //check the preceding neighbor
-    if (inputIndex > 0 && candidateIndex > 0) {
-        if (input[inputIndex - 1] == candidate[candidateIndex - 1]) {
-            matches++;
+    sqlite3* db_;
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>
+        statement_{nullptr, sqlite3_finalize};
+};
+
+std::vector<LineMatch> findSimilarLines(sqlite3* db, const LineDescriptor& input) {
+    const auto range = lineBucketRange(input);
+
+    Statement query(db, R"SQL(
+        SELECT image_path, function_id, angle_degrees, normalized_length
+        FROM line_buckets
+        WHERE angle_bucket IN (?, ?, ?)
+          AND length_bucket BETWEEN ? AND ?;
+    )SQL");
+
+    query.bind(1, range.angles[0]);
+    query.bind(2, range.angles[1]);
+    query.bind(3, range.angles[2]);
+    query.bind(4, range.minLength);
+    query.bind(5, range.maxLength);
+
+    std::vector<LineMatch> matches;
+    while (query.next()) {
+        sqlite3_stmt* row = query.get();
+        const auto difference = compareLines(input, {
+            sqlite3_column_double(row, 2), sqlite3_column_double(row, 3)
+        });
+        if (difference) {
+            matches.push_back({
+                reinterpret_cast<const char*>(sqlite3_column_text(row, 0)),
+                sqlite3_column_int(row, 1),
+                difference->angle,
+                difference->length
+            });
         }
     }
-    //Check the following neighbor
-    if (inputIndex + 1 < static_cast<int>(input.size()) &&
-        candidateIndex + 1 < static_cast<int>(candidate.size())) {
-
-        if (input[inputIndex + 1] == candidate[candidateIndex + 1]) {
-            matches++;
-        }
-    }
+    std::sort(matches.begin(), matches.end(), [](const LineMatch& a, const LineMatch& b) {
+        return std::tie(a.angleDifference, a.relativeLengthDifference, a.imagePath, a.functionID)
+             < std::tie(b.angleDifference, b.relativeLengthDifference, b.imagePath, b.functionID);
+    });
     return matches;
 }
 
 
+std::optional<LineDescriptor> describeLine(const functionData& function, double imageDiagonal) {
+    if (function.isBezier)
+        return std::nullopt;
+    const double dx = function.end.x - function.start.x;
+    const double dy = function.end.y - function.start.y;
+    const double length = std::hypot(dx, dy);
 
+    if (imageDiagonal <= 0.0 || length == 0.0)
+        return std::nullopt;
 
-std::vector<matchCandidate> match(const json& input, const std::vector<functionPattern>& patterns, const std::vector<PathRecord>& datasetPaths) {
+    const double degrees = std::atan2(dy, dx) * 180.0 / std::acos(-1.0);
+    const double orientation = std::fmod(degrees + 180.0, 180.0);
 
-    double diagonal = std::hypot(input.at("width").get<double>(), input.at("height").get<double>());
-    std::vector<matchCandidate> candidates;
+    return LineDescriptor{orientation, length / imageDiagonal};
+}
 
-    //traverse through components
-    for (const auto& path : input.at("piecewisePaths")) {
-        //create a record for the current input path
-        PathRecord inputPath;
-        inputPath.componentID = path.at("edgeID").get<int>();
-        inputPath.pathID = path.at("pathID").get<int>();
-        const auto& segments = path.at("segments");
+void initializeLineBuckets(sqlite3* db) {
+    execute(db, R"SQL(
+        CREATE TABLE IF NOT EXISTS line_buckets (
+            image_path TEXT NOT NULL,
+            function_id INTEGER NOT NULL,
+            angle_degrees REAL NOT NULL,
+            normalized_length REAL NOT NULL,
+            angle_bucket INTEGER NOT NULL,
+            length_bucket INTEGER NOT NULL,
+            PRIMARY KEY (image_path, function_id),
+            FOREIGN KEY (image_path, function_id)
+                REFERENCES image_functions(image_path, function_id)
+                ON DELETE CASCADE
+        );
 
-        for (const auto& segment : segments) {
-            std::string type = segment.at("type").get<std::string>();
-            const json& function = segment.at("data");
-
-            std::vector<double> descriptor = createDescriptor(type, function, diagonal);
-            int matchedPatternID = -1;
-
-            for (const functionPattern& pattern : patterns) {
-                if (pattern.type != type) {
-                    continue;
-                }
-                bool matched = false;
-                if (type == "line") {
-                    matched = matchLinear(descriptor, pattern.descriptor, 10.0, 0.10);
-                }
-                else if (type == "bezier") {
-                    matched =
-                        descriptorDistance(descriptor, pattern.descriptor) <= 0.05;
-                }
-                if (matched) {
-                    matchedPatternID = pattern.patternID;
-                    break;
-                }
-            }
-            inputPath.functionIDs.push_back(function.at("id").get<int>());
-            inputPath.patternIDs.push_back(matchedPatternID);
-        }
-
-        //iterate through segments while tracking their positions
-        for (size_t inputIndex = 0; inputIndex < segments.size(); ++inputIndex) {
-            const auto& segment = segments[inputIndex];
-            std::string type = segment.at("type");
-            const json& function = segment.at("data");
-
-            std::vector<double> descriptor = createDescriptor(type, function, diagonal);
-             //begin comparisions with the current function dataset
-            for(const functionPattern& pattern: patterns){
-                if(pattern.type != type){
-                    continue;
-                }
-                bool matched = false;
-                //linear
-                if(type == "line"){
-                    matched = matchLinear(descriptor, pattern.descriptor, 10.0, 0.10);
-                }
-                else if(type == "bezier"){
-                    double distance = descriptorDistance(descriptor, pattern.descriptor);
-                    matched = (distance <= 0.05);
-                }
-                //dont have this line in the set yet
-                if(!matched){
-                    continue;
-                }
-                for(const auto& occurrence: pattern.occurrences){
-                    //check neighbors
-                    int neighborMatches = 0;
-                    //existing cnadidates
-                    
-                    auto pathIt = std::find_if(datasetPaths.begin(), datasetPaths.end(), [&](const PathRecord& record) {
-                        return record.meshID == occurrence.meshID && record.imageID == occurrence.imageID && record.componentID == occurrence.componentID && record.pathID == occurrence.pathID;
-                    });
-
-                    int candidateIndex = -1;
-
-                    if (pathIt != datasetPaths.end()) {
-                        const PathRecord& candidatePath = *pathIt;
-                        auto functionIt = std::find(candidatePath.functionIDs.begin(), candidatePath.functionIDs.end(), occurrence.functionID);
-
-                        if (functionIt != candidatePath.functionIDs.end()) {
-                            candidateIndex = static_cast<int>(std::distance(candidatePath.functionIDs.begin(), functionIt));
-                        }
-                    }
-                    if (pathIt != datasetPaths.end() && candidateIndex >= 0) {
-                        neighborMatches = verifyNeighbors(
-                            inputPath,
-                            *pathIt,
-                            static_cast<int>(inputIndex),
-                            candidateIndex
-                        );
-                    }
-                    auto it = std::find_if(candidates.begin(),candidates.end(),[&](const matchCandidate& candidate) {
-                        //if the matching function also has matching neighbors with the input
-                        return candidate.meshID == occurrence.meshID && candidate.imageID == occurrence.imageID;
-                        });
-                    if(it == candidates.end()){
-                        matchCandidate candidate;
-                        candidate.meshID = occurrence.meshID;
-                        candidate.imageID = occurrence.imageID;
-                        candidates.push_back(candidate);
-                        it = std::prev(candidates.end());
-                    }
-                    it->matchedFunctions++;
-                    //keep track of the matching neighbors as well
-                    it->matchedNeighbors+=neighborMatches;
-                }
-            }
-        }
-    
-           
-        }
-    
-    //soft ranking based on how many matching neighbors a function has
-    for(matchCandidate& candidate: candidates){
-        candidate.score = candidate.matchedFunctions + (2.0 * candidate.matchedNeighbors);
-    }
-    //find highest scoring edgemap
-    std::sort(
-        candidates.begin(), candidates.end(), [](const matchCandidate& a, const matchCandidate& b) {
-            return a.score > b.score;
-        }
-    );
-
-
-    return candidates;
+        CREATE INDEX IF NOT EXISTS idx_line_buckets_geometry
+            ON line_buckets(angle_bucket, length_bucket);
+    )SQL");
 }
 
 
-//temp export function, no heavy calculations
-std::vector<PointMatch> findPoints(
-    const json& input,
-    const TokenDataset& dataset,
-    const std::vector<matchCandidate>& candidates
+void saveLineBucket(Statement& insert,const std::string& imagePath, const functionData& function, double imageDiagonal) {
+    const auto descriptor = describeLine(function, imageDiagonal);
+    if (!descriptor)
+        return;
+
+    insert.bind(1, imagePath);
+    insert.bind(2, function.id);
+    insert.bind(3, descriptor->angleDegrees);
+    insert.bind(4, descriptor->normalizedLength);
+    insert.bind(5, static_cast<int>(
+        descriptor->angleDegrees / angleBucketWidth));
+    insert.bind(6, static_cast<int>(
+        descriptor->normalizedLength / lengthBucketWidth));
+    insert.write();
+}
+
+
+std::vector<FunctionNeighbor> findFunctionNeighbors(
+    const std::vector<functionData>& functions,
+    double tolerance = neighborTolerancePixels
 ) {
-    std::vector<PointMatch> results;
-    std::unordered_set<int> selectedPatterns;
-
-    if (candidates.empty())
-        return results;
-
-    const std::string bestMeshID = candidates.front().meshID;
-
-    double diagonal = std::hypot(
-        input.at("width").get<double>(),
-        input.at("height").get<double>()
-    );
-
-    for (const auto& path : input.at("piecewisePaths")) {
-        for (const auto& segment : path.at("segments")) {
-
-            std::string type = segment.at("type").get<std::string>();
-            const json& function = segment.at("data");
-
-            std::vector<double> descriptor =
-                createDescriptor(type, function, diagonal);
-
-            int bestPatternID = -1;
-            double bestDistance = std::numeric_limits<double>::infinity();
-            const functionPattern* bestPattern = nullptr;
-
-            // Find the closest matching function pattern
-            for (const auto& pattern : dataset.patterns) {
-                if (pattern.type != type)
-                    continue;
-
-                bool matched = false;
-                double distance = descriptorDistance(
-                    descriptor, pattern.descriptor
-                );
-
-                if (type == "line") {
-                    matched = matchLinear(
-                        descriptor, pattern.descriptor, 10.0, 0.10
-                    );
-                }
-                else if (type == "bezier") {
-                    matched = distance <= 0.05;
-                }
-
-                if (matched && distance < bestDistance) {
-                    bestDistance = distance;
-                    bestPatternID = pattern.patternID;
-                    bestPattern = &pattern;
-                }
-            }
-
-            if (bestPattern == nullptr)
+    std::vector<FunctionNeighbor> neighbors;
+    for (std::size_t i = 0; i < functions.size(); ++i) {
+        const auto& first = functions[i];
+        for (std::size_t j = i + 1; j < functions.size(); ++j) {
+            const auto& second = functions[j];
+            if (first.componentID != second.componentID)
                 continue;
 
-            // Return one occurrence per distinct pattern
-            if (!selectedPatterns.insert(bestPatternID).second)
-                continue;
-
-            const FunctionOccurrence* selectedOccurrence = nullptr;
-
-            // Prefer an occurrence from the highest-ranked mesh
-            for (const auto& occurrence : bestPattern->occurrences) {
-                if (occurrence.meshID == bestMeshID) {
-                    selectedOccurrence = &occurrence;
-                    break;
-                }
+            const double distance = std::min({
+                cv::norm(first.start - second.start),
+                cv::norm(first.start - second.end),
+                cv::norm(first.end - second.start),
+                cv::norm(first.end - second.end)
+            });
+            if (distance <= tolerance) {
+                neighbors.push_back({first.id, second.id, distance});
+                neighbors.push_back({second.id, first.id, distance});
             }
-
-            // Fall back to another mesh when necessary
-            if (selectedOccurrence == nullptr &&
-                !bestPattern->occurrences.empty()) {
-                selectedOccurrence = &bestPattern->occurrences.front();
-            }
-
-            if (selectedOccurrence == nullptr)
-                continue;
-
-            PointMatch result;
-            result.patternID = bestPatternID;
-            result.meshID = selectedOccurrence->meshID;
-            result.imageID = selectedOccurrence->imageID;
-            result.componentID = selectedOccurrence->componentID;
-            result.pathID = selectedOccurrence->pathID;
-            result.functionID = selectedOccurrence->functionID;
-            result.type = type;
-            result.distance = bestDistance;
-
-            results.push_back(std::move(result));
         }
     }
-
-    return results;
+    return neighbors;
 }
 
 
+void initializeFunctionTables(sqlite3* db) {
+    execute(db, R"SQL(
+        PRAGMA foreign_keys = ON;
 
-std::vector<EdgeFunction> loadDatasetEdges(const fs::path& datasetRoot) {
-    std::vector<EdgeFunction> functions;
+        CREATE TABLE IF NOT EXISTS image_functions (
+            image_path TEXT NOT NULL,
+            function_id INTEGER NOT NULL,
+            component_id INTEGER NOT NULL,
+            path_id INTEGER NOT NULL,
+            a REAL NOT NULL,
+            b REAL NOT NULL,
+            c REAL NOT NULL,
+            start_x REAL NOT NULL,
+            start_y REAL NOT NULL,
+            end_x REAL NOT NULL,
+            end_y REAL NOT NULL,
+            PRIMARY KEY (image_path, function_id)
+        );
+        CREATE TABLE IF NOT EXISTS image_function_neighbors (
+            image_path TEXT NOT NULL,
+            function_id INTEGER NOT NULL,
+            neighbor_id INTEGER NOT NULL,
+            distance_pixels REAL NOT NULL CHECK (distance_pixels >= 0),
+            PRIMARY KEY (image_path, function_id, neighbor_id),
+            FOREIGN KEY (image_path, function_id)
+                REFERENCES image_functions(image_path, function_id) ON DELETE CASCADE,
+            FOREIGN KEY (image_path, neighbor_id)
+                REFERENCES image_functions(image_path, function_id) ON DELETE CASCADE,
+            CHECK (function_id <> neighbor_id)
+        );
 
+        CREATE INDEX IF NOT EXISTS idx_image_function_neighbors_reverse
+            ON image_function_neighbors(image_path, neighbor_id);
+
+        CREATE TABLE IF NOT EXISTS bezier_functions (
+            image_path TEXT NOT NULL,
+            function_id INTEGER NOT NULL CHECK (function_id < 0),
+            control_x REAL NOT NULL,
+            control_y REAL NOT NULL,
+            PRIMARY KEY (image_path, function_id),
+            FOREIGN KEY (image_path, function_id)
+                REFERENCES image_functions(image_path, function_id) ON DELETE CASCADE
+        );
+    )SQL");
+}
+
+void saveImageFunctions(
+    sqlite3* db,
+    const std::string& imagePath,
+    const std::vector<functionData>& functions,
+    const std::vector<FunctionNeighbor>& neighbors,
+    double imageDiagonal
+) {
+    execute(db, "BEGIN IMMEDIATE;");
+    try {
+        Statement remove(db, "DELETE FROM image_functions WHERE image_path = ?;");
+        remove.bind(1, imagePath);
+        remove.write();
+
+        Statement insertFunction(db, R"SQL(
+            INSERT INTO image_functions (
+                image_path, function_id, component_id, path_id, a, b, c,
+                start_x, start_y, end_x, end_y
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        )SQL");
+        Statement insertBucket(db, R"SQL(
+            INSERT INTO line_buckets (
+                image_path, function_id, angle_degrees, normalized_length,
+                angle_bucket, length_bucket
+            ) VALUES (?, ?, ?, ?, ?, ?);
+        )SQL");
+        Statement insertCurve(db, "INSERT INTO bezier_functions VALUES (?, ?, ?, ?);");
+        for (const auto& function : functions) {
+            insertFunction.bind(1, imagePath);
+            insertFunction.bind(2, function.id);
+            insertFunction.bind(3, function.componentID);
+            insertFunction.bind(4, function.pathID);
+            insertFunction.bind(5, function.a);
+            insertFunction.bind(6, function.b);
+            insertFunction.bind(7, function.c);
+            insertFunction.bind(8, function.start.x);
+            insertFunction.bind(9, function.start.y);
+            insertFunction.bind(10, function.end.x);
+            insertFunction.bind(11, function.end.y);
+            insertFunction.write();
+            saveLineBucket(insertBucket, imagePath, function, imageDiagonal);
+            if (function.isBezier) {
+                insertCurve.bind(1, imagePath);
+                insertCurve.bind(2, function.id);
+                insertCurve.bind(3, function.control.x);
+                insertCurve.bind(4, function.control.y);
+                insertCurve.write();
+            }
+        }
+        Statement insertNeighbor(db, R"SQL(
+            INSERT INTO image_function_neighbors (
+                image_path, function_id, neighbor_id, distance_pixels
+            ) VALUES (?, ?, ?, ?);
+        )SQL");
+        for (const auto& neighbor : neighbors) {
+            insertNeighbor.bind(1, imagePath);
+            insertNeighbor.bind(2, neighbor.functionID);
+            insertNeighbor.bind(3, neighbor.neighborID);
+            insertNeighbor.bind(4, neighbor.distancePixels);
+            insertNeighbor.write();
+        }
+        execute(db, "COMMIT;");
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        throw;
+    }
+}
+
+bool hasBezierTable(sqlite3* db) {
+    Statement table(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bezier_functions';");
+    return table.next();
+}
+
+struct NearbyFunction {functionData function; double distancePixels;};
+
+std::vector<NearbyFunction> lookupFunctionNeighbors(sqlite3* db, const std::string& imagePath, int functionID) {
+    Statement query(db, R"SQL(
+        SELECT f.function_id, f.component_id, f.path_id, f.a, f.b, f.c,
+               f.start_x, f.start_y, f.end_x, f.end_y, n.distance_pixels
+        FROM image_function_neighbors AS n
+        JOIN image_functions AS f
+          ON f.image_path = n.image_path AND f.function_id = n.neighbor_id
+        WHERE n.image_path = ? AND n.function_id = ?
+        ORDER BY n.distance_pixels, n.neighbor_id;
+    )SQL");
+    query.bind(1, imagePath);
+    query.bind(2, functionID);
+
+    std::vector<NearbyFunction> neighbors;
+    while (query.next()) {
+        sqlite3_stmt* row = query.get();
+        functionData function;
+        function.id = sqlite3_column_int(row, 0);
+        function.componentID = sqlite3_column_int(row, 1);
+        function.pathID = sqlite3_column_int(row, 2);
+        function.a = sqlite3_column_double(row, 3);
+        function.b = sqlite3_column_double(row, 4);
+        function.c = sqlite3_column_double(row, 5);
+        function.start = {sqlite3_column_double(row, 6), sqlite3_column_double(row, 7)};
+        function.end = {sqlite3_column_double(row, 8), sqlite3_column_double(row, 9)};
+        neighbors.push_back({function, sqlite3_column_double(row, 10)});
+    }
+    if (hasBezierTable(db)) {
+        for (auto& neighbor : neighbors) {
+            Statement curve(db, "SELECT control_x, control_y FROM bezier_functions WHERE image_path=? AND function_id=?;");
+            curve.bind(1, imagePath);
+            curve.bind(2, neighbor.function.id);
+            if (curve.next()) {
+                neighbor.function.isBezier = true;
+                neighbor.function.control = {sqlite3_column_double(curve.get(), 0), sqlite3_column_double(curve.get(), 1)};
+            }
+        }
+    }
+    return neighbors;
+}
+
+void printFunction(const functionData& function) {
+    std::cout << "Function " << function.id
+              << " | Component " << function.componentID
+              << " | Path " << function.pathID;
+    if (function.isBezier)
+        std::cout << "\n  Quadratic Bezier control: " << function.control;
+    else
+        std::cout << "\n  Equation: " << function.a << "x + "
+                  << function.b << "y + " << function.c << " = 0";
+    std::cout << "\n  Start: " << function.start << " | End: " << function.end << '\n';
+}
+
+
+std::string normalizePath(const std::filesystem::path& path) {
+    return std::filesystem::absolute(path).lexically_normal().make_preferred().string();
+}
+
+void indexImage(sqlite3* db, const std::string& imagePath, bool printGeometry) {
+    cv::Size imageSize;
+    const auto functions = encodeObjectFunctions(imagePath, imageSize);
+    const auto neighbors = findFunctionNeighbors(functions);
+    const double diagonal = std::hypot(imageSize.width, imageSize.height);
+    saveImageFunctions(db, imagePath, functions, neighbors, diagonal);
+
+    if (printGeometry) {
+        for (const auto& function : functions)
+            printFunction(function);
+    }
+    std::cout << "Saved: " << imagePath
+              << " | Functions: " << functions.size()
+              << " | Neighbor pairs: " << neighbors.size() / 2 << '\n';
+}
+
+int processDataset(sqlite3* db, const std::filesystem::path& datasetRoot) {
+    namespace fs = std::filesystem;
+    std::size_t indexed = 0;
+    std::size_t failed = 0;
     for (const auto& entry : fs::recursive_directory_iterator(datasetRoot)) {
-
-        if (!entry.is_regular_file() ||
-            entry.path().extension() != ".json" ||
-            entry.path().filename() == "index.json") {
+        if (!entry.is_regular_file())
             continue;
-        }
 
-        std::ifstream file(entry.path());
-
-        if (!file) {
+        std::string extension = entry.path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (extension != ".png" && extension != ".jpg" && extension != ".jpeg")
             continue;
-        }
 
         try {
-            json data;
-            file >> data;
-
-            std::string meshID =data.at("meshID").get<std::string>();
-            std::string imageID =data.at("imageID").get<std::string>();
-
-            double width = data.value("width", 512.0);
-            double height = data.value("height", 512.0);
-            double diagonal = std::hypot(width, height);
-
-            for (const auto& path : data.at("piecewisePaths")) {
-                int componentID = path.at("edgeID").get<int>();
-                int pathID = path.at("pathID").get<int>();
-                int sequenceIndex = 0;
-
-                for (const auto& segment : path.at("segments")) {
-
-                    std::string type =segment.at("type").get<std::string>();
-                    const json& function = segment.at("data");
-                    std::vector<double> descriptor =createDescriptor(type, function, diagonal);
-
-                    if (descriptor.empty()) {
-                        continue;
-                    }
-
-                    EdgeFunction record;
-
-                    record.meshID = meshID;
-                    record.imageID = imageID;
-
-                    record.componentID = componentID;
-                    record.pathID = pathID;
-
-                    record.functionID =function.at("id").get<int>();
-
-                    record.sequenceIndex = sequenceIndex++;
-                    record.type = type;
-                    record.descriptor = std::move(descriptor);
-                    record.parameters = function;
-
-                    functions.push_back(std::move(record));
-                }
-            }
-
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading "  << entry.path() << ": "  << e.what() << '\n';
+            indexImage(db, normalizePath(entry.path()), false);
+            ++indexed;
+        } catch (const std::exception& error) {
+            std::cerr << "Failed: " << entry.path() << " | " << error.what() << '\n';
+            ++failed;
         }
     }
-
-    return functions;
+    std::cout << "Dataset: " << indexed << " indexed, " << failed << " failed.\n";
+    if (indexed == 0 && failed == 0)
+        std::cerr << "No supported images found in " << datasetRoot << '\n';
+    return indexed > 0 && failed == 0 ? 0 : 1;
 }
 
+int refreshReferenceCurves(sqlite3* db) {
+    initializeFunctionTables(db);
+    std::vector<std::string> paths;
+    Statement images(db, "SELECT DISTINCT image_path FROM image_functions ORDER BY image_path;");
+    while (images.next())
+        paths.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(images.get(), 0)));
 
-
-int getOrCreateToken(
-    sqlite3* db,
-    const std::string& type,
-    const std::vector<double>& descriptor,
-    double angleTolerance = 10.0 * 3.14159265358979323846 / 180.0,
-    double lengthTolerance = 0.10,
-    double bezierTolerance = 0.05
-) {
-    if (type != "line" && type != "bezier") {
-        throw std::invalid_argument("Unsupported token type: " + type);
-    }
-
-    const char* searchSQL = R"SQL(
-        SELECT tokenID, descriptor
-        FROM tokens
-        WHERE type = ?;
-    )SQL";
-
-    sqlite3_stmt* stmt = nullptr;
-
-    if (sqlite3_prepare_v2(db, searchSQL, -1, &stmt, nullptr) != SQLITE_OK) {
-        throw std::runtime_error(sqlite3_errmsg(db));
-    }
-
-    sqlite3_bind_text(
-        stmt, 1, type.c_str(), -1, SQLITE_TRANSIENT
-    );
-
-    int existingID = -1;
-    int result;
-
-    try {
-        while ((result = sqlite3_step(stmt)) == SQLITE_ROW) {
-            int tokenID = sqlite3_column_int(stmt, 0);
-
-            const char* descriptorText =
-                reinterpret_cast<const char*>(
-                    sqlite3_column_text(stmt, 1)
-                );
-
-            if (!descriptorText) continue;
-
-            std::vector<double> stored =
-                json::parse(descriptorText).get<std::vector<double>>();
-
-            bool matches = false;
-
-            if (type == "line" &&
-                descriptor.size() == 2 &&
-                stored.size() == 2) {
-
-                // Angles are normalized by PI and direction-independent.
-                double angleDiff = std::abs(descriptor[0] - stored[0]);
-                angleDiff = std::min(angleDiff, 1.0 - angleDiff);
-
-                double lengthDiff =
-                    std::abs(descriptor[1] - stored[1]);
-
-                double scale = std::max(
-                    {std::abs(descriptor[1]),
-                     std::abs(stored[1]), 1e-9}
-                );
-
-                matches =
-                    angleDiff <= angleTolerance / 3.14159265358979323846 &&
-                    lengthDiff <= lengthTolerance * scale;
-
-            } else if (type == "bezier" &&
-                       descriptor.size() == stored.size() &&
-                       !descriptor.empty()) {
-
-                double squaredDistance = 0.0;
-
-                for (size_t i = 0; i < descriptor.size(); ++i) {
-                    double diff = descriptor[i] - stored[i];
-                    squaredDistance += diff * diff;
-                }
-
-                matches = std::sqrt(squaredDistance) <= bezierTolerance;
+    std::size_t completed = 0, failed = 0, curveCount = 0;
+    for (const auto& imagePath : paths) {
+        try {
+            std::filesystem::path source(imagePath);
+            const std::string oldRoot = "F:\\CARLA set\\";
+            if (!std::filesystem::is_regular_file(source) && imagePath.rfind(oldRoot, 0) == 0)
+                source = "F:\\CARLA\\" + imagePath.substr(oldRoot.size());
+            cv::Size imageSize;
+            const auto encoded = encodeObjectFunctions(source.string(), imageSize);
+            std::vector<functionData> functions;
+            Statement lines(db, "SELECT function_id, component_id, path_id, start_x, start_y, end_x, end_y FROM image_functions WHERE image_path=? AND function_id>=0;");
+            lines.bind(1, imagePath);
+            while (lines.next()) {
+                functionData line;
+                auto* row = lines.get();
+                line.id = sqlite3_column_int(row, 0);
+                line.componentID = sqlite3_column_int(row, 1);
+                line.pathID = sqlite3_column_int(row, 2);
+                line.start = {sqlite3_column_double(row, 3), sqlite3_column_double(row, 4)};
+                line.end = {sqlite3_column_double(row, 5), sqlite3_column_double(row, 6)};
+                functions.push_back(line);
             }
+            for (const auto& function : encoded) {
+                if (function.isBezier)
+                    functions.push_back(function);
+            }
+            const auto neighbors = findFunctionNeighbors(functions);
+            execute(db, "BEGIN IMMEDIATE;");
+            try {
+                Statement remove(db, "DELETE FROM image_functions WHERE image_path=? AND function_id<0;");
+                remove.bind(1, imagePath);
+                remove.write();
+                Statement insert(db, "INSERT INTO image_functions VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?);");
+                Statement control(db, "INSERT INTO bezier_functions VALUES (?, ?, ?, ?);");
+                for (const auto& function : functions) {
+                    if (!function.isBezier)
+                        continue;
+                    insert.bind(1, imagePath);
+                    insert.bind(2, function.id);
+                    insert.bind(3, function.componentID);
+                    insert.bind(4, function.pathID);
+                    insert.bind(5, function.start.x);
+                    insert.bind(6, function.start.y);
+                    insert.bind(7, function.end.x);
+                    insert.bind(8, function.end.y);
+                    insert.write();
+                    control.bind(1, imagePath);
+                    control.bind(2, function.id);
+                    control.bind(3, function.control.x);
+                    control.bind(4, function.control.y);
+                    control.write();
+                }
+                Statement link(db, "INSERT INTO image_function_neighbors VALUES (?, ?, ?, ?);");
+                for (const auto& neighbor : neighbors) {
+                    if (neighbor.functionID >= 0 && neighbor.neighborID >= 0)
+                        continue;
+                    link.bind(1, imagePath);
+                    link.bind(2, neighbor.functionID);
+                    link.bind(3, neighbor.neighborID);
+                    link.bind(4, neighbor.distancePixels);
+                    link.write();
+                }
+                execute(db, "COMMIT;");
+            } catch (...) {
+                sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+                throw;
+            }
+            curveCount += std::count_if(encoded.begin(), encoded.end(), [](const auto& f) { return f.isBezier; });
+            ++completed;
+            std::cout << "Refreshed curves: " << completed << "/" << paths.size() << " | " << imagePath << std::endl;
+        } catch (const std::exception& error) {
+            ++failed;
+            std::cerr << "Curve refresh failed: " << imagePath << " | " << error.what() << '\n';
+        }
+    }
+    std::cout << "Curve refresh: " << completed << " images, " << curveCount << " curves, " << failed << " failed.\n";
+    return failed == 0 && completed > 0 ? 0 : 1;
+}
 
-            if (matches) {
-                existingID = tokenID;
+struct NeighborLink {
+    int functionID;
+    unsigned endpoints;
+};
+
+using NeighborGraph = std::unordered_map<int, std::vector<NeighborLink>>;
+using LineCandidates = std::vector<std::vector<LineMatch>>;
+
+unsigned attachedEndpoints(
+    const cv::Point2d& start, const cv::Point2d& end,
+    const cv::Point2d& neighborStart, const cv::Point2d& neighborEnd
+) {
+    const bool atStart = std::min(cv::norm(start - neighborStart),
+                                  cv::norm(start - neighborEnd)) <= neighborTolerancePixels;
+    const bool atEnd = std::min(cv::norm(end - neighborStart),
+                                cv::norm(end - neighborEnd)) <= neighborTolerancePixels;
+    return (atStart ? 1u : 0u) | (atEnd ? 2u : 0u);
+}
+
+NeighborGraph loadReferenceNeighbors(sqlite3* db, const std::string& imagePath) {
+    Statement query(db, R"SQL(
+        SELECT n.function_id, n.neighbor_id,
+               f.start_x, f.start_y, f.end_x, f.end_y,
+               g.start_x, g.start_y, g.end_x, g.end_y
+        FROM image_function_neighbors AS n
+        JOIN image_functions AS f
+          ON f.image_path = n.image_path AND f.function_id = n.function_id
+        JOIN image_functions AS g
+          ON g.image_path = n.image_path AND g.function_id = n.neighbor_id
+        WHERE n.image_path = ?
+        ORDER BY n.function_id, n.neighbor_id;
+    )SQL");
+    query.bind(1, imagePath);
+
+    NeighborGraph graph;
+    while (query.next()) {
+        auto* row = query.get();
+        const auto point = [row](int column) {
+            return cv::Point2d(sqlite3_column_double(row, column),
+                               sqlite3_column_double(row, column + 1));
+        };
+        graph[sqlite3_column_int(row, 0)].push_back({
+            sqlite3_column_int(row, 1),
+            attachedEndpoints(point(2), point(4), point(6), point(8))
+        });
+    }
+    return graph;
+}
+
+const std::vector<NeighborLink>& neighborsOf(const NeighborGraph& graph, int id) {
+    static const std::vector<NeighborLink> empty;
+    const auto found = graph.find(id);
+    return found == graph.end() ? empty : found->second;
+}
+
+std::size_t countMatchingNeighbors(
+    const std::vector<NeighborLink>& input,
+    const std::vector<NeighborLink>& reference,
+    const std::unordered_map<int, std::size_t>& inputIndex,
+    const LineCandidates& candidates,
+    bool reversed
+) {
+    std::unordered_set<int> used;
+    for (const auto& link : input) {
+        // Bits 0 and 1 represent the anchor's start and end, respectively.
+        const unsigned endpoints = reversed
+            ? ((link.endpoints & 1u) << 1) | ((link.endpoints & 2u) >> 1)
+            : link.endpoints;
+        const auto& allowed = candidates[inputIndex.at(link.functionID)];
+        for (const auto& other : reference) {
+            if ((endpoints & other.endpoints) == 0 || used.count(other.functionID))
+                continue;
+            const auto sameFunction = [&other](const LineMatch& candidate) {
+                return candidate.functionID == other.functionID;
+            };
+            if (std::any_of(allowed.begin(), allowed.end(), sameFunction)) {
+                used.insert(other.functionID);
                 break;
             }
         }
-
-        if (existingID == -1 && result != SQLITE_DONE) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-
-    } catch (...) {
-        sqlite3_finalize(stmt);
-        throw;
     }
-
-    sqlite3_finalize(stmt);
-
-    if (existingID != -1) {
-        return existingID;
-    }
-
-    // No matching token: create a new persistent ID.
-    // SQLite chooses an unused positive ID above the current maximum.
-    const char* insertSQL = R"SQL(
-        INSERT INTO tokens (type, descriptor)
-        VALUES (?, ?);
-    )SQL";
-
-    if (sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr) != SQLITE_OK) {
-        throw std::runtime_error(sqlite3_errmsg(db));
-    }
-
-    std::string descriptorJSON = json(descriptor).dump();
-
-    sqlite3_bind_text(
-        stmt, 1, type.c_str(), -1, SQLITE_TRANSIENT
-    );
-
-    sqlite3_bind_text(
-        stmt, 2, descriptorJSON.c_str(), -1, SQLITE_TRANSIENT
-    );
-
-    result = sqlite3_step(stmt);
-
-    if (result != SQLITE_DONE) {
-        std::string error = sqlite3_errmsg(db);
-        sqlite3_finalize(stmt);
-        throw std::runtime_error(error);
-    }
-
-    sqlite3_finalize(stmt);
-
-    return static_cast<int>(sqlite3_last_insert_rowid(db));
+    return used.size();
 }
 
-
-
-
-
-TokenDataset tokenizeFunctions(
-    sqlite3* db,
-    const std::vector<EdgeFunction>& functions
-) {
-    TokenDataset dataset;
-
-    // SQLite tokenID -> index in dataset.patterns
-    std::unordered_map<int, size_t> tokenIndex;
-
-    for (const EdgeFunction& function : functions) {
-
-        // Retrieve existing token or create a new one in SQLite
-        int tokenID = getOrCreateToken(
-            db,
-            function.type,
-            function.descriptor
-        );
-
-        size_t patternIndex;
-
-        auto it = tokenIndex.find(tokenID);
-
-        if (it == tokenIndex.end()) {
-
-            // First occurrence of this token in the current dataset
-            functionPattern pattern;
-
-            pattern.patternID = tokenID;
-            pattern.type = function.type;
-            pattern.descriptor = function.descriptor;
-
-            patternIndex = dataset.patterns.size();
-
-            dataset.patterns.push_back(std::move(pattern));
-
-            tokenIndex[tokenID] = patternIndex;
-
-        } else {
-            // Token already encountered in this dataset
-            patternIndex = it->second;
-        }
-
-        // Record this function's occurrence
-        FunctionOccurrence occurrence;
-
-        occurrence.meshID = function.meshID;
-        occurrence.imageID = function.imageID;
-        occurrence.componentID = function.componentID;
-        occurrence.pathID = function.pathID;
-        occurrence.functionID = function.functionID;
-
-        dataset.patterns[patternIndex].occurrences.push_back(
-            std::move(occurrence)
-        );
-    }
-
-    return dataset;
-}
-
-
-
-void buildNeighbors(std::vector<PathRecord>& paths) {
-
-    for (PathRecord& path : paths) {
-        path.neighbors.clear();
-        const auto& tokens = path.patternIDs;
-
-        for (size_t i = 0; i < tokens.size(); i++) {
-            int currentToken = tokens[i];
-            // Previous neighbor
-            if (i > 0) {
-                path.neighbors.push_back({
-                    currentToken,
-                    tokens[i - 1],
-                    -1
-                });
-            }
-            // Next neighbor
-            if (i + 1 < tokens.size()) {
-                path.neighbors.push_back({
-                    currentToken,
-                    tokens[i + 1],
-                    +1
-                });
-            }
-        }
-    }
-}
-
-
-void initializeDatabase(sqlite3* db) {
-    const char* sql = R"SQL(
-        PRAGMA foreign_keys = ON;
-
-        CREATE TABLE IF NOT EXISTS merged_path_functions (
-            pathKey INTEGER NOT NULL,
-            sequenceIndex INTEGER NOT NULL,
-            tokenID INTEGER NOT NULL,
-            startIndex INTEGER NOT NULL,
-            endIndex INTEGER NOT NULL,
-
-            PRIMARY KEY(pathKey, sequenceIndex),
-            FOREIGN KEY(pathKey) REFERENCES paths(pathKey),
-            FOREIGN KEY(tokenID) REFERENCES tokens(tokenID)
-        );
-
-
-        CREATE TABLE IF NOT EXISTS tokens (
-            tokenID INTEGER PRIMARY KEY,
-            type TEXT NOT NULL,
-            descriptor TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS paths (
-            pathKey INTEGER PRIMARY KEY,
-            meshID TEXT NOT NULL,
-            imageID TEXT NOT NULL,
-            componentID INTEGER NOT NULL,
-            pathID INTEGER NOT NULL,
-            UNIQUE(meshID, imageID, componentID, pathID)
-        );
-
-        CREATE TABLE IF NOT EXISTS occurrences (
-            occurrenceID INTEGER PRIMARY KEY,
-            tokenID INTEGER NOT NULL,
-            pathKey INTEGER NOT NULL,
-            functionID INTEGER NOT NULL,
-            sequenceIndex INTEGER NOT NULL,
-            parameters TEXT NOT NULL,
-
-            FOREIGN KEY(tokenID) REFERENCES tokens(tokenID),
-            FOREIGN KEY(pathKey) REFERENCES paths(pathKey),
-            UNIQUE(pathKey, sequenceIndex)
-        );
-
-        CREATE TABLE IF NOT EXISTS path_functions (
-            pathKey INTEGER NOT NULL,
-            sequenceIndex INTEGER NOT NULL,
-            tokenID INTEGER NOT NULL,
-
-            PRIMARY KEY(pathKey, sequenceIndex),
-
-            FOREIGN KEY(pathKey) REFERENCES paths(pathKey),
-            FOREIGN KEY(tokenID) REFERENCES tokens(tokenID)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_occurrences_token
-            ON occurrences(tokenID);
-
-        CREATE INDEX IF NOT EXISTS idx_path_functions_token
-            ON path_functions(tokenID);
-
-        CREATE TABLE IF NOT EXISTS token_merges (
-            mergeID INTEGER PRIMARY KEY AUTOINCREMENT,
-            firstToken INTEGER NOT NULL,
-            secondToken INTEGER NOT NULL,
-            compositeToken INTEGER NOT NULL UNIQUE,
-            frequency INTEGER NOT NULL,
-            createdAt TEXT DEFAULT CURRENT_TIMESTAMP,
-
-            UNIQUE(firstToken, secondToken),
-
-            FOREIGN KEY(firstToken) REFERENCES tokens(tokenID),
-            FOREIGN KEY(secondToken) REFERENCES tokens(tokenID)
-        );
-        CREATE TABLE IF NOT EXISTS function_clusters (
-        clusterID INTEGER PRIMARY KEY,
-        tokenSequence TEXT NOT NULL UNIQUE,
-        tokenCount INTEGER NOT NULL,
-        frequency INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS cluster_occurrences (
-        clusterID INTEGER NOT NULL,
-        pathKey INTEGER NOT NULL,
-        startIndex INTEGER NOT NULL,
-        endIndex INTEGER NOT NULL,
-
-        PRIMARY KEY(clusterID, pathKey, startIndex),
-
-        FOREIGN KEY(clusterID)
-            REFERENCES function_clusters(clusterID),
-
-        FOREIGN KEY(pathKey)
-            REFERENCES paths(pathKey)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_cluster_occurrences_path
-    ON cluster_occurrences(pathKey);
-
-    CREATE TABLE IF NOT EXISTS edge_maps (
-    edgeMapID INTEGER PRIMARY KEY,
-    meshID TEXT NOT NULL,
-    imageID TEXT NOT NULL,
-
-    componentCount INTEGER DEFAULT 0,
-    pathCount INTEGER DEFAULT 0,
-
-    UNIQUE(meshID, imageID)
-    );
-
-    CREATE TABLE IF NOT EXISTS edge_map_features (
-        edgeMapID INTEGER NOT NULL,
-        featureType TEXT NOT NULL,
-        featureID INTEGER NOT NULL,
-        frequency INTEGER NOT NULL,
-
-        PRIMARY KEY(edgeMapID, featureType, featureID),
-
-        FOREIGN KEY(edgeMapID)
-            REFERENCES edge_maps(edgeMapID)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_edge_map_feature_lookup
-    ON edge_map_features(featureType, featureID);
-
-        CREATE TABLE IF NOT EXISTS token_neighbors (
-        tokenID INTEGER NOT NULL,
-        neighborTokenID INTEGER NOT NULL,
-        relativePosition INTEGER NOT NULL,
-        frequency INTEGER NOT NULL,
-
-        PRIMARY KEY (
-            tokenID,
-            neighborTokenID,
-            relativePosition
-        ),
-
-        FOREIGN KEY(tokenID) REFERENCES tokens(tokenID),
-        FOREIGN KEY(neighborTokenID) REFERENCES tokens(tokenID)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_token_neighbors
-    ON token_neighbors(tokenID, relativePosition);
-
-    )SQL";
-
-    char* errorMessage = nullptr;
-
-    int result = sqlite3_exec(
-        db,
-        sql,
-        nullptr,
-        nullptr,
-        &errorMessage
-    );
-
-    if (result != SQLITE_OK) {
-        std::cerr << "SQLite error: "
-                  << (errorMessage ? errorMessage : "Unknown error")
-                  << '\n';
-
-        sqlite3_free(errorMessage);
-        throw std::runtime_error("Database initialization failed");
-    }
-}
-
-
-
-sqlite3* openDatabase(const std::string& databasePath) {
-
-    sqlite3* db = nullptr;
-
-    if (sqlite3_open(databasePath.c_str(), &db) != SQLITE_OK) {
-        std::string error =
-            db ? sqlite3_errmsg(db) : "Cannot allocate database";
-
-        if (db) {
-            sqlite3_close(db);
-        }
-
-        throw std::runtime_error(error);
-    }
-    try {
-        initializeDatabase(db);
-    } catch (...) {
-        sqlite3_close(db);
-        throw;
-    }
-
-    return db;
-}
-
-
-void saveTokenDataset(
-    sqlite3* db,
-    const TokenDataset& dataset,
-    const std::vector<EdgeFunction>& functions
-) {
-    // Helper for executing SQL statements
-    auto execute = [&](const char* sql) {
-        char* error = nullptr;
-
-        if (sqlite3_exec(db, sql, nullptr, nullptr, &error) != SQLITE_OK) {
-            std::string message = error ? error : "Unknown SQLite error";
-            sqlite3_free(error);
-            throw std::runtime_error(message);
-        }
-    };
-
-    // Helper for preparing statements
-    auto prepare = [&](const char* sql) -> sqlite3_stmt* {
-        sqlite3_stmt* stmt = nullptr;
-
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-
-        return stmt;
-    };
-
-    // Helper for executing a prepared statement
-    auto step = [&](sqlite3_stmt* stmt) {
-        if (sqlite3_step(stmt) != SQLITE_DONE) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-
-        sqlite3_reset(stmt);
-        sqlite3_clear_bindings(stmt);
-    };
-
-    sqlite3_stmt* tokenStmt = nullptr;
-    sqlite3_stmt* pathStmt = nullptr;
-    sqlite3_stmt* pathKeyStmt = nullptr;
-    sqlite3_stmt* occurrenceStmt = nullptr;
-    sqlite3_stmt* pathFunctionStmt = nullptr;
-
-    try {
-        execute("BEGIN IMMEDIATE TRANSACTION;");
-
-        tokenStmt = prepare(R"(
-            INSERT INTO tokens (tokenID, type, descriptor)
-            VALUES (?, ?, ?)
-            ON CONFLICT(tokenID) DO NOTHING;
-        )");
-
-        pathStmt = prepare(R"(
-            INSERT INTO paths (meshID, imageID, componentID, pathID)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(meshID, imageID, componentID, pathID)
-            DO NOTHING;
-        )");
-
-        pathKeyStmt = prepare(R"(
-            SELECT pathKey FROM paths
-            WHERE meshID = ?
-              AND imageID = ?
-              AND componentID = ?
-              AND pathID = ?;
-        )");
-
-        occurrenceStmt = prepare(R"(
-            INSERT INTO occurrences (
-                tokenID, pathKey, functionID,
-                sequenceIndex, parameters
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(pathKey, sequenceIndex) DO UPDATE SET
-                tokenID = excluded.tokenID,
-                functionID = excluded.functionID,
-                parameters = excluded.parameters;
-        )");
-
-        pathFunctionStmt = prepare(R"(
-            INSERT INTO path_functions (
-                pathKey, sequenceIndex, tokenID
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(pathKey, sequenceIndex) DO UPDATE SET
-                tokenID = excluded.tokenID;
-        )");
-
-        // 1. Save token vocabulary
-        for (const functionPattern& token : dataset.patterns) {
-
-            std::string descriptor = json(token.descriptor).dump();
-
-            sqlite3_bind_int(tokenStmt, 1, token.patternID);
-            sqlite3_bind_text(tokenStmt, 2, token.type.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(tokenStmt, 3, descriptor.c_str(), -1, SQLITE_TRANSIENT);
-
-            step(tokenStmt);
-        }
-
-        // Build a lookup from source function to token ID
-        // This avoids searching every token for every function.
-        std::unordered_map<std::string, int> functionTokens;
-
-        auto makeKey = [](
-            const std::string& mesh,
-            const std::string& image,
-            int component,
-            int path,
-            int function
-        ) {
-            return json::array({
-                mesh, image, component, path, function
-            }).dump();
-        };
-
-        for (const functionPattern& token : dataset.patterns) {
-            for (const FunctionOccurrence& occurrence : token.occurrences) {
-                functionTokens[makeKey(
-                    occurrence.meshID,
-                    occurrence.imageID,
-                    occurrence.componentID,
-                    occurrence.pathID,
-                    occurrence.functionID
-                )] = token.patternID;
-            }
-        }
-
-        // 2. Save reconstructed paths
-        for (const PathRecord& path : dataset.paths) {
-
-            sqlite3_bind_text(pathStmt, 1, path.meshID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(pathStmt, 2, path.imageID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(pathStmt, 3, path.componentID);
-            sqlite3_bind_int(pathStmt, 4, path.pathID);
-
-            step(pathStmt);
-        }
-
-        // 3. Save every original function occurrence
-        for (const EdgeFunction& function : functions) {
-
-            std::string key = makeKey(
-                function.meshID,
-                function.imageID,
-                function.componentID,
-                function.pathID,
-                function.functionID
-            );
-
-            auto tokenIt = functionTokens.find(key);
-
-            if (tokenIt == functionTokens.end()) {
-                throw std::runtime_error(
-                    "Missing token assignment for function: " + key
-                );
-            }
-
-            int tokenID = tokenIt->second;
-
-            // Ensure the function's path exists, including
-            // paths that may not yet be in dataset.paths.
-            sqlite3_bind_text(pathStmt, 1, function.meshID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(pathStmt, 2, function.imageID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(pathStmt, 3, function.componentID);
-            sqlite3_bind_int(pathStmt, 4, function.pathID);
-
-            step(pathStmt);
-
-            // Retrieve the database-generated pathKey
-            sqlite3_bind_text(pathKeyStmt, 1, function.meshID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(pathKeyStmt, 2, function.imageID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(pathKeyStmt, 3, function.componentID);
-            sqlite3_bind_int(pathKeyStmt, 4, function.pathID);
-
-            if (sqlite3_step(pathKeyStmt) != SQLITE_ROW) {
-                throw std::runtime_error(
-                    "Failed to retrieve pathKey: " + key
-                );
-            }
-
-            int pathKey = sqlite3_column_int(pathKeyStmt, 0);
-
-            sqlite3_reset(pathKeyStmt);
-            sqlite3_clear_bindings(pathKeyStmt);
-
-            std::string parameters = function.parameters.dump();
-
-            sqlite3_bind_int(occurrenceStmt, 1, tokenID);
-            sqlite3_bind_int(occurrenceStmt, 2, pathKey);
-            sqlite3_bind_int(occurrenceStmt, 3, function.functionID);
-            sqlite3_bind_int(occurrenceStmt, 4, function.sequenceIndex);
-            sqlite3_bind_text(
-                occurrenceStmt, 5,
-                parameters.c_str(), -1, SQLITE_TRANSIENT
-            );
-
-            step(occurrenceStmt);
-
-            // The sequence index preserves the original path order.
-            sqlite3_bind_int(pathFunctionStmt, 1, pathKey);
-            sqlite3_bind_int(pathFunctionStmt, 2, function.sequenceIndex);
-            sqlite3_bind_int(pathFunctionStmt, 3, tokenID);
-
-            step(pathFunctionStmt);
-        }
-
-        execute("COMMIT;");
-
-        std::cout << "Saved "
-                  << dataset.patterns.size()
-                  << " tokens and "
-                  << functions.size()
-                  << " function occurrences to SQLite.\n";
-
-    } catch (...) {
-        // Finalize statements before rolling back.
-        sqlite3_finalize(tokenStmt);
-        sqlite3_finalize(pathStmt);
-        sqlite3_finalize(pathKeyStmt);
-        sqlite3_finalize(occurrenceStmt);
-        sqlite3_finalize(pathFunctionStmt);
-
-        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
-        throw;
-    }
-
-    sqlite3_finalize(tokenStmt);
-    sqlite3_finalize(pathStmt);
-    sqlite3_finalize(pathKeyStmt);
-    sqlite3_finalize(occurrenceStmt);
-    sqlite3_finalize(pathFunctionStmt);
-}
-
-
-
-std::vector<TokenMerge> findMergeCandidates(
-    sqlite3* db,
-    int minimumFrequency = 2
-) {
-    std::vector<TokenMerge> candidates;
-
-    const char* sql = R"SQL(
-        SELECT
-            a.tokenID,
-            b.tokenID,
-            COUNT(*) AS frequency
-        FROM path_functions a
-        JOIN path_functions b
-            ON a.pathKey = b.pathKey
-            AND b.sequenceIndex = a.sequenceIndex + 1
-        GROUP BY a.tokenID, b.tokenID
-        HAVING COUNT(*) >= ?
-        ORDER BY frequency DESC, a.tokenID, b.tokenID;
-    )SQL";
-
-    sqlite3_stmt* stmt = nullptr;
-
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        throw std::runtime_error(sqlite3_errmsg(db));
-    }
-
-    sqlite3_bind_int(stmt, 1, minimumFrequency);
-
-    int result;
-
-    while ((result = sqlite3_step(stmt)) == SQLITE_ROW) {
-        candidates.push_back({
-            sqlite3_column_int(stmt, 0),
-            sqlite3_column_int(stmt, 1),
-            sqlite3_column_int(stmt, 2)
-        });
-    }
-
-    if (result != SQLITE_DONE) {
-        std::string error = sqlite3_errmsg(db);
-        sqlite3_finalize(stmt);
-        throw std::runtime_error(error);
-    }
-
-    sqlite3_finalize(stmt);
-    return candidates;
-}
-
-
-void mergeTokens(sqlite3* db, int minimumFrequency = 2) {
-    if (minimumFrequency < 2) {
-        throw std::invalid_argument("Minimum frequency must be at least 2");
-    }
-
-    std::vector<TokenMerge> candidates =
-        findMergeCandidates(db, minimumFrequency);
-
-    std::cout << "Merge candidates: "
-              << candidates.size() << std::endl;
-
-    if (candidates.empty()) {
-        std::cout << "No qualifying token pairs found.\n";
-        return;
-    }
-
-    auto execute = [&](const char* sql) {
-        char* error = nullptr;
-
-        if (sqlite3_exec(db, sql, nullptr, nullptr, &error) != SQLITE_OK) {
-            std::string message = error ? error : "SQLite error";
-            sqlite3_free(error);
-            throw std::runtime_error(message);
-        }
-    };
-
-    execute("BEGIN IMMEDIATE TRANSACTION;");
-
-    sqlite3_stmt* insertToken = nullptr;
-    sqlite3_stmt* insertMerge = nullptr;
-    sqlite3_stmt* findExisting = nullptr;
-
-    try {
-        const char* tokenSQL = R"SQL(
-            INSERT INTO tokens (tokenID, type, descriptor)
-            VALUES (?, 'composite', ?);
-        )SQL";
-
-        const char* mergeSQL = R"SQL(
-            INSERT INTO token_merges
-                (firstToken, secondToken, compositeToken, frequency)
-            VALUES (?, ?, ?, ?);
-        )SQL";
-
-        const char* existingSQL = R"SQL(
-            SELECT compositeToken
-            FROM token_merges
-            WHERE firstToken = ? AND secondToken = ?;
-        )SQL";
-
-        auto prepare = [&](const char* sql, sqlite3_stmt** stmt) {
-            if (sqlite3_prepare_v2(db, sql, -1, stmt, nullptr) != SQLITE_OK) {
-                throw std::runtime_error(sqlite3_errmsg(db));
-            }
-        };
-
-        prepare(tokenSQL, &insertToken);
-        prepare(mergeSQL, &insertMerge);
-        prepare(existingSQL, &findExisting);
-
-        int nextTokenID = 0;
-
-        sqlite3_stmt* maxStmt = nullptr;
-
-        prepare(
-            R"SQL(
-                SELECT MAX(id) FROM (
-                    SELECT tokenID AS id FROM tokens
-                    UNION ALL
-                    SELECT compositeToken AS id FROM token_merges
-                );
-            )SQL",
-            &maxStmt
-        );
-
-        if (sqlite3_step(maxStmt) == SQLITE_ROW &&
-            sqlite3_column_type(maxStmt, 0) != SQLITE_NULL) {
-            nextTokenID = sqlite3_column_int(maxStmt, 0) + 1;
-        }
-
-        sqlite3_finalize(maxStmt);
-
-        int created = 0;
-        int existing = 0;
-
-        for (const TokenMerge& candidate : candidates) {
-            sqlite3_reset(findExisting);
-            sqlite3_clear_bindings(findExisting);
-
-            sqlite3_bind_int(findExisting, 1, candidate.firstToken);
-            sqlite3_bind_int(findExisting, 2, candidate.secondToken);
-
-            int result = sqlite3_step(findExisting);
-
-            if (result == SQLITE_ROW) {
-                ++existing;
-                continue;
-            }
-
-            if (result != SQLITE_DONE) {
-                throw std::runtime_error(sqlite3_errmsg(db));
-            }
-
-            int compositeID = nextTokenID++;
-
-            // Store the two child IDs as the composite descriptor.
-            std::string descriptor = json::array({
-                candidate.firstToken,
-                candidate.secondToken
-            }).dump();
-
-            sqlite3_reset(insertToken);
-            sqlite3_clear_bindings(insertToken);
-
-            sqlite3_bind_int(insertToken, 1, compositeID);
-            sqlite3_bind_text(
-                insertToken, 2,
-                descriptor.c_str(), -1, SQLITE_TRANSIENT
-            );
-
-            if (sqlite3_step(insertToken) != SQLITE_DONE) {
-                throw std::runtime_error(sqlite3_errmsg(db));
-            }
-
-            sqlite3_reset(insertMerge);
-            sqlite3_clear_bindings(insertMerge);
-
-            sqlite3_bind_int(insertMerge, 1, candidate.firstToken);
-            sqlite3_bind_int(insertMerge, 2, candidate.secondToken);
-            sqlite3_bind_int(insertMerge, 3, compositeID);
-            sqlite3_bind_int(insertMerge, 4, candidate.frequency);
-
-            if (sqlite3_step(insertMerge) != SQLITE_DONE) {
-                throw std::runtime_error(sqlite3_errmsg(db));
-            }
-
-            std::cout
-                << "Created composite token " << compositeID
-                << " = [" << candidate.firstToken
-                << ", " << candidate.secondToken << "]"
-                << " | Frequency: " << candidate.frequency
-                << '\n';
-
-            ++created;
-        }
-
-        sqlite3_finalize(insertToken);
-        sqlite3_finalize(insertMerge);
-        sqlite3_finalize(findExisting);
-
-        insertToken = nullptr;
-        insertMerge = nullptr;
-        findExisting = nullptr;
-
-        execute("COMMIT;");
-
-        std::cout << "New composite tokens: " << created << '\n';
-        std::cout << "Existing merges skipped: " << existing << '\n';
-
-    } catch (...) {
-        sqlite3_finalize(insertToken);
-        sqlite3_finalize(insertMerge);
-        sqlite3_finalize(findExisting);
-
-        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
-        throw;
-    }
-}
-
-
-
-void encodeCompositeTokens(sqlite3* db) {
-
-    struct MergeRule {
-        int compositeID;
-        int frequency;
-    };
-
-    struct PathToken {
-        int tokenID;
-        int startIndex;
-        int endIndex;
-    };
-
-    auto check = [&](int rc) {
-        if (rc != SQLITE_OK) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-    };
-
-    auto execute = [&](const char* sql) {
-        char* error = nullptr;
-        int rc = sqlite3_exec(db, sql, nullptr, nullptr, &error);
-
-        if (rc != SQLITE_OK) {
-            std::string message = error ? error : "SQLite error";
-            sqlite3_free(error);
-            throw std::runtime_error(message);
-        }
-    };
-
-    auto prepare = [&](const char* sql) {
-        sqlite3_stmt* stmt = nullptr;
-        check(sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr));
-        return stmt;
-    };
-
-    // Map original token pairs to composite IDs.
-    std::map<std::pair<int, int>, MergeRule> rules;
-
-    sqlite3_stmt* ruleStmt = prepare(
-        "SELECT firstToken, secondToken, compositeToken, frequency "
-        "FROM token_merges;"
-    );
-
-    try {
-        int rc;
-
-        while ((rc = sqlite3_step(ruleStmt)) == SQLITE_ROW) {
-            int first = sqlite3_column_int(ruleStmt, 0);
-            int second = sqlite3_column_int(ruleStmt, 1);
-
-            rules[{first, second}] = {
-                sqlite3_column_int(ruleStmt, 2),
-                sqlite3_column_int(ruleStmt, 3)
-            };
-        }
-
-        if (rc != SQLITE_DONE) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-    } catch (...) {
-        sqlite3_finalize(ruleStmt);
-        throw;
-    }
-
-    sqlite3_finalize(ruleStmt);
-
-    // Load original sequences.
-    std::map<int, std::vector<PathToken>> paths;
-
-    sqlite3_stmt* pathStmt = prepare(
-        "SELECT pathKey, sequenceIndex, tokenID "
-        "FROM path_functions "
-        "ORDER BY pathKey, sequenceIndex;"
-    );
-
-    try {
-        int rc;
-
-        while ((rc = sqlite3_step(pathStmt)) == SQLITE_ROW) {
-            int pathKey = sqlite3_column_int(pathStmt, 0);
-            int index = sqlite3_column_int(pathStmt, 1);
-            int tokenID = sqlite3_column_int(pathStmt, 2);
-
-            paths[pathKey].push_back({tokenID, index, index});
-        }
-
-        if (rc != SQLITE_DONE) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-    } catch (...) {
-        sqlite3_finalize(pathStmt);
-        throw;
-    }
-
-    sqlite3_finalize(pathStmt);
-
-    // Build compressed paths in memory before modifying the DB.
-    std::map<int, std::vector<PathToken>> compressedPaths;
-
-    int originalCount = 0;
-    int compressedCount = 0;
-    int mergesApplied = 0;
-
-    for (const auto& [pathKey, tokens] : paths) {
-
-        auto& output = compressedPaths[pathKey];
-
-        originalCount += static_cast<int>(tokens.size());
-
-        size_t i = 0;
-
-        while (i < tokens.size()) {
-
-            if (i + 1 < tokens.size() &&
-                tokens[i + 1].startIndex == tokens[i].endIndex + 1) {
-
-                auto it = rules.find({
-                    tokens[i].tokenID,
-                    tokens[i + 1].tokenID
-                });
-
-                if (it != rules.end()) {
-
-                    output.push_back({
-                        it->second.compositeID,
-                        tokens[i].startIndex,
-                        tokens[i + 1].endIndex
-                    });
-
-                    mergesApplied++;
-                    i += 2;
-                    continue;
-                }
-            }
-
-            output.push_back(tokens[i]);
-            i++;
-        }
-
-        compressedCount += static_cast<int>(output.size());
-    }
-
-    // Save compressed sequences atomically.
-    execute("BEGIN IMMEDIATE TRANSACTION;");
-
-    sqlite3_stmt* insertStmt = nullptr;
-
-    try {
-        execute("DELETE FROM merged_path_functions;");
-
-        insertStmt = prepare(
-            "INSERT INTO merged_path_functions "
-            "(pathKey, sequenceIndex, tokenID, startIndex, endIndex) "
-            "VALUES (?, ?, ?, ?, ?);"
-        );
-
-        for (const auto& [pathKey, tokens] : compressedPaths) {
-
-            for (size_t i = 0; i < tokens.size(); i++) {
-
-                sqlite3_bind_int(insertStmt, 1, pathKey);
-                sqlite3_bind_int(insertStmt, 2, static_cast<int>(i));
-                sqlite3_bind_int(insertStmt, 3, tokens[i].tokenID);
-                sqlite3_bind_int(insertStmt, 4, tokens[i].startIndex);
-                sqlite3_bind_int(insertStmt, 5, tokens[i].endIndex);
-
-                if (sqlite3_step(insertStmt) != SQLITE_DONE) {
-                    throw std::runtime_error(sqlite3_errmsg(db));
-                }
-
-                sqlite3_reset(insertStmt);
-                sqlite3_clear_bindings(insertStmt);
-            }
-        }
-
-        sqlite3_finalize(insertStmt);
-        insertStmt = nullptr;
-
-        execute("COMMIT;");
-
-    } catch (...) {
-        if (insertStmt) sqlite3_finalize(insertStmt);
-        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
-        throw;
-    }
-
-    std::cout << "Original tokens: " << originalCount << '\n';
-    std::cout << "Compressed tokens: " << compressedCount << '\n';
-    std::cout << "Composite merges applied: " << mergesApplied << '\n';
-}
-
-
-
-void exportPointMatches(
-    const std::vector<PointMatch>& matches,
-    const fs::path& outputPath
-) {
-    json output;
-    output["matches"] = json::array();
-
-    for (const PointMatch& match : matches) {
-        output["matches"].push_back({
-            {"patternID", match.patternID},
-            {"meshID", match.meshID},
-            {"imageID", match.imageID},
-            {"componentID", match.componentID},
-            {"pathID", match.pathID},
-            {"functionID", match.functionID},
-            {"type", match.type},
-            {"distance", match.distance}
-        });
-    }
-
-    std::ofstream file(outputPath);
-
-    if (!file) {
-        throw std::runtime_error(
-            "Failed to open output file: " + outputPath.string()
-        );
-    }
-
-    file << output.dump(2);
-}
-
-
-//grouping similiar edgemaps
-void objectLookup(sqlite3* db){
-    //add exsiting neighbors from the existing sqlite table
-    const char* sql = R"SQL(
-        INSERT INTO token_neighbors (
-            tokenID,
-            neighborTokenID,
-            relativePosition,
-            frequency
-        )
-
-        SELECT
-            a.tokenID,
-            b.tokenID,
-            CASE
-                WHEN b.sequenceIndex < a.sequenceIndex
-                    THEN -1
-                ELSE 1
-            END,
-            COUNT(*)
-
-        FROM path_functions a
-
-        JOIN path_functions b
-            ON a.pathKey = b.pathKey
-            AND (
-                b.sequenceIndex = a.sequenceIndex - 1
-                OR
-                b.sequenceIndex = a.sequenceIndex + 1
-            )
-
-        GROUP BY
-            a.tokenID,
-            b.tokenID,
-            CASE
-                WHEN b.sequenceIndex < a.sequenceIndex
-                    THEN -1
-                ELSE 1
-            END
-
-        ON CONFLICT(
-            tokenID,
-            neighborTokenID,
-            relativePosition
-        )
-
-        DO UPDATE SET
-            frequency = excluded.frequency;
-    )SQL";
-
-    char* error = nullptr;
-    int result = sqlite3_exec(db, sql, nullptr, nullptr, &error);
-
-    if (result != SQLITE_OK) {
-        std::string message =
-            error ? error : "SQLite error";
-        sqlite3_free(error);
-        throw std::runtime_error(message);
-    }
-
-    std::cout<< "Token connectivity lookup built.\n";
-}
-
-
-
-void groupConnectedNeighbors(sqlite3* db, int minimumFrequency = 2, int maximumClusterSize = 5) {
-    if (minimumFrequency < 1 || maximumClusterSize < 2) {
-        throw std::invalid_argument("Invalid clustering parameters");
-    }
-
-    struct Occurrence {
-        int pathKey;
-        int startIndex;
-        int endIndex;
-    };
-
-    using Sequence = std::vector<int>;
-
-    //maps a token sequence to its occurrences.
-    std::map<Sequence, std::vector<Occurrence>> clusters;
-
-    const char* sql = R"SQL(
-        SELECT pathKey, sequenceIndex, tokenID
-        FROM path_functions
-        ORDER BY pathKey, sequenceIndex;
-    )SQL";
-
-    sqlite3_stmt* stmt = nullptr;
-
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        throw std::runtime_error(sqlite3_errmsg(db));
-    }
-
-    //each path stores its ordered token sequence.
-    struct PathToken {
-        int sequenceIndex;
-        int tokenID;
-    };
-    std::map<int, std::vector<PathToken>> paths;
-    int rc;
-
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int pathKey = sqlite3_column_int(stmt, 0);
-        int sequenceIndex = sqlite3_column_int(stmt, 1);
-        int tokenID = sqlite3_column_int(stmt, 2);
-
-        paths[pathKey].push_back({
-            sequenceIndex,
-            tokenID
-        });
-    }
-
-    if (rc != SQLITE_DONE) {
-        std::string error = sqlite3_errmsg(db);
-        sqlite3_finalize(stmt);
-        throw std::runtime_error(error);
-    }
-    sqlite3_finalize(stmt);
-
-    //finder connected sequences.
-    for (const auto& [pathKey, tokens] : paths) {
-        for (size_t start = 0; start < tokens.size(); ++start) {
-            Sequence sequence;
-
-            for (size_t length = 1; length <= static_cast<size_t>(maximumClusterSize) && start + length <= tokens.size(); ++length) {
-                size_t index = start + length - 1;
-                //require consecutive positions in the same path.
-                if (index > start &&
-                    tokens[index].sequenceIndex !=
-                    tokens[index - 1].sequenceIndex + 1) {
-                    break;
-                }
-                sequence.push_back(tokens[index].tokenID);
-                if (length < 2) {
-                    continue;
-                }
-
-                clusters[sequence].push_back({
-                    pathKey,
-                    tokens[start].sequenceIndex,
-                    tokens[index].sequenceIndex
-                });
-            }
-        }
-    }
-
-    //sqlite handler
-    auto execute = [&](const char* statement) {
-        char* error = nullptr;
-
-        if (sqlite3_exec(db, statement, nullptr, nullptr, &error)
-            != SQLITE_OK) {
-            std::string message = error ? error : "SQLite error";
-            sqlite3_free(error);
-            throw std::runtime_error(message);
-        }
-    };
-
-    sqlite3_stmt* insertCluster = nullptr;
-    sqlite3_stmt* insertOccurrence = nullptr;
-
-    try {
-        execute("BEGIN IMMEDIATE TRANSACTION;");
-
-        //rebuild the cluster index.
-        execute("DELETE FROM cluster_occurrences;");
-        execute("DELETE FROM function_clusters;");
-
-        const char* clusterSQL = R"SQL(
-            INSERT INTO function_clusters
-                (tokenSequence, tokenCount, frequency)
-            VALUES (?, ?, ?);
-        )SQL";
-
-        const char* occurrenceSQL = R"SQL(
-            INSERT INTO cluster_occurrences
-                (clusterID, pathKey, startIndex, endIndex)
-            VALUES (?, ?, ?, ?);
-        )SQL";
-
-        if (sqlite3_prepare_v2(db, clusterSQL, -1,
-                               &insertCluster, nullptr) != SQLITE_OK ||
-            sqlite3_prepare_v2(db, occurrenceSQL, -1,
-                               &insertOccurrence, nullptr) != SQLITE_OK) {
-            throw std::runtime_error(sqlite3_errmsg(db));
-        }
-        int createdClusters = 0;
-
-        for (const auto& [sequence, occurrences] : clusters) {
-            if (static_cast<int>(occurrences.size())
-                < minimumFrequency) {
-                continue;
-            }
-
-            std::string sequenceJSON = json(sequence).dump();
-            sqlite3_bind_text(insertCluster, 1, sequenceJSON.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(insertCluster, 2, static_cast<int>(sequence.size()));
-            sqlite3_bind_int(insertCluster, 3, static_cast<int>(occurrences.size()));
-
-            if (sqlite3_step(insertCluster) != SQLITE_DONE) {
-                throw std::runtime_error(sqlite3_errmsg(db));
-            }
-            sqlite3_reset(insertCluster);
-            sqlite3_clear_bindings(insertCluster);
-
-            int clusterID =static_cast<int>(sqlite3_last_insert_rowid(db));
-
-            for (const Occurrence& occurrence : occurrences) {
-                sqlite3_bind_int(insertOccurrence, 1, clusterID);
-                sqlite3_bind_int(insertOccurrence, 2, occurrence.pathKey);
-                sqlite3_bind_int(insertOccurrence, 3, occurrence.startIndex);
-                sqlite3_bind_int(insertOccurrence, 4, occurrence.endIndex);
-
-                if (sqlite3_step(insertOccurrence) != SQLITE_DONE) {
-                    throw std::runtime_error(sqlite3_errmsg(db));
-                }
-                sqlite3_reset(insertOccurrence);
-                sqlite3_clear_bindings(insertOccurrence);
-            }
-            ++createdClusters;
-        }
-
-        sqlite3_finalize(insertCluster);
-        sqlite3_finalize(insertOccurrence);
-        insertCluster = nullptr;
-        insertOccurrence = nullptr;
-        execute("COMMIT;");
-
-        std::cout << "Geometric clusters created: " << createdClusters << '\n';
-
-    } catch (...) {
-        sqlite3_finalize(insertCluster);
-        sqlite3_finalize(insertOccurrence);
-        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
-        throw;
-    }
-}
-
-
-void buildEdgeMapIndex(sqlite3* db) {
-
-    const char* sql = R"SQL(
-
-        INSERT OR IGNORE INTO edge_maps (
-            meshID,
-            imageID
-        )
-        SELECT DISTINCT
-            meshID,
-            imageID
-        FROM paths;
-
-        UPDATE edge_maps
-        SET componentCount = (
-            SELECT COUNT(DISTINCT componentID)
-            FROM paths
-            WHERE paths.meshID = edge_maps.meshID
-              AND paths.imageID = edge_maps.imageID
-        );
-
-        UPDATE edge_maps
-        SET pathCount = (
-            SELECT COUNT(*)
-            FROM paths
-            WHERE paths.meshID = edge_maps.meshID
-              AND paths.imageID = edge_maps.imageID
-        );
-
-        DELETE FROM edge_map_features;
-
-        -- Count individual geometric tokens.
-        INSERT INTO edge_map_features (
-            edgeMapID,
-            featureType,
-            featureID,
-            frequency
-        )
-        SELECT
-            em.edgeMapID,
-            'token',
-            pf.tokenID,
-            COUNT(*)
-
-        FROM edge_maps em
-
-        JOIN paths p
-            ON p.meshID = em.meshID
-           AND p.imageID = em.imageID
-
-        JOIN path_functions pf
-            ON pf.pathKey = p.pathKey
-
-        GROUP BY
-            em.edgeMapID,
-            pf.tokenID;
-
-        -- Count connected geometric clusters.
-        INSERT INTO edge_map_features (
-            edgeMapID,
-            featureType,
-            featureID,
-            frequency
-        )
-        SELECT
-            em.edgeMapID,
-            'cluster',
-            co.clusterID,
-            COUNT(*)
-
-        FROM edge_maps em
-
-        JOIN paths p
-            ON p.meshID = em.meshID
-           AND p.imageID = em.imageID
-
-        JOIN cluster_occurrences co
-            ON co.pathKey = p.pathKey
-
-        GROUP BY
-            em.edgeMapID,
-            co.clusterID;
-
-    )SQL";
-
-    char* error = nullptr;
-
-    int result = sqlite3_exec(
-        db,
-        sql,
-        nullptr,
-        nullptr,
-        &error
-    );
-
-    if (result != SQLITE_OK) {
-        std::string message =
-            error ? error : "SQLite error";
-
-        sqlite3_free(error);
-        throw std::runtime_error(message);
-    }
-
-    std::cout << "Edge-map feature index built.\n";
-}
-
-
-
-
-
-using FeatureKey = std::pair<std::string, int>;
-using FeatureCounts = std::map<FeatureKey, int>;
-
-// Load the existing token vocabulary.
-// Never insert new tokens while classifying an input.
-std::vector<functionPattern> loadTokenVocabulary(sqlite3* db) {
-    std::vector<functionPattern> patterns;
-
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "SELECT tokenID, type, descriptor "
-        "FROM tokens WHERE type IN ('line', 'bezier');";
-
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr)
-        != SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(db));
-
-    try {
-        int rc;
-        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            functionPattern pattern;
-            pattern.patternID = sqlite3_column_int(stmt, 0);
-
-            const char* type = reinterpret_cast<const char*>(
-                sqlite3_column_text(stmt, 1));
-            const char* desc = reinterpret_cast<const char*>(
-                sqlite3_column_text(stmt, 2));
-
-            pattern.type = type;
-            pattern.descriptor =
-                json::parse(desc).get<std::vector<double>>();
-
-            patterns.push_back(std::move(pattern));
-        }
-
-        if (rc != SQLITE_DONE)
-            throw std::runtime_error(sqlite3_errmsg(db));
-    } catch (...) {
-        sqlite3_finalize(stmt);
-        throw;
-    }
-
-    sqlite3_finalize(stmt);
-    return patterns;
-}
-
-// Find the closest existing geometric token.
-int lookupToken(
-    const std::string& type,
-    const std::vector<double>& descriptor,
-    const std::vector<functionPattern>& vocabulary
-) {
-    int bestID = -1;
-    double bestDistance = std::numeric_limits<double>::infinity();
-
-    for (const auto& pattern : vocabulary) {
-        if (pattern.type != type)
-            continue;
-
-        bool valid = false;
-
-        if (type == "line")
-            valid = matchLinear(
-                descriptor, pattern.descriptor, 10.0, 0.10);
-
-        else if (type == "bezier")
-            valid = descriptorDistance(
-                descriptor, pattern.descriptor) <= 0.05;
-
-        if (!valid)
-            continue;
-
-        double distance =
-            descriptorDistance(descriptor, pattern.descriptor);
-
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            bestID = pattern.patternID;
-        }
-    }
-
-    return bestID;
-}
-
-// Read the recurring structural patterns.
-std::map<std::vector<int>, int> loadClusterVocabulary(
-    sqlite3* db
-) {
-    std::map<std::vector<int>, int> clusters;
-
-    sqlite3_stmt* stmt = nullptr;
-    const char* sql =
-        "SELECT clusterID, tokenSequence FROM function_clusters;";
-
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr)
-        != SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(db));
-
-    try {
-        int rc;
-        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            int id = sqlite3_column_int(stmt, 0);
-            const char* value = reinterpret_cast<const char*>(
-                sqlite3_column_text(stmt, 1));
-
-            clusters[json::parse(value)
-                .get<std::vector<int>>()] = id;
-        }
-
-        if (rc != SQLITE_DONE)
-            throw std::runtime_error(sqlite3_errmsg(db));
-    } catch (...) {
-        sqlite3_finalize(stmt);
-        throw;
-    }
-
-    sqlite3_finalize(stmt);
-    return clusters;
-}
-
-// Convert an input edge map into the same features
-// stored in edge_map_features.
-FeatureCounts encodeInputFeatures(
-    const json& input,
-    const std::vector<functionPattern>& vocabulary,
-    const std::map<std::vector<int>, int>& clusters
-) {
-    FeatureCounts features;
-
-    double diagonal = std::hypot(
-        input.at("width").get<double>(),
-        input.at("height").get<double>());
-
-    for (const auto& path : input.at("piecewisePaths")) {
-        std::vector<int> tokens;
-
-        for (const auto& segment : path.at("segments")) {
-            std::string type =
-                segment.at("type").get<std::string>();
-
-            auto descriptor = createDescriptor(
-                type, segment.at("data"), diagonal);
-
-            int tokenID = lookupToken(
-                type, descriptor, vocabulary);
-
-            tokens.push_back(tokenID);
-
-            if (tokenID >= 0)
-                features[{"token", tokenID}]++;
-        }
-
-        // Match consecutive sequences of 2 to 5 tokens.
-        for (size_t start = 0; start < tokens.size(); ++start) {
-            std::vector<int> sequence;
-
-            for (size_t length = 1;
-                 length <= 5 && start + length <= tokens.size();
-                 ++length) {
-
-                int id = tokens[start + length - 1];
-
-                // Unknown tokens break a connected sequence.
-                if (id < 0)
-                    break;
-
-                sequence.push_back(id);
-
-                if (length < 2)
-                    continue;
-
-                auto it = clusters.find(sequence);
-
-                if (it != clusters.end())
-                    features[{"cluster", it->second}]++;
-            }
-        }
-    }
-
-    return features;
-}
-
-// Compare an input against the indexed reference edge maps.
-std::vector<EdgeMapCandidate> matchEdgeMaps(
-    sqlite3* db,
-    const json& input,
-    size_t topK = 10,
-    const std::string& excludeMeshID = "",
-    const std::string& excludeImageID = ""
-) {
-    auto vocabulary = loadTokenVocabulary(db);
-    auto clusters = loadClusterVocabulary(db);
-
-    FeatureCounts inputFeatures =
-        encodeInputFeatures(input, vocabulary, clusters);
-    
-    int tokenCount = 0;
-    int clusterCount = 0;
-
-    for (const auto& [key, frequency] : inputFeatures) {
-        if (key.first == "token")
-            tokenCount += frequency;
-
-        else if (key.first == "cluster")
-            clusterCount += frequency;
-    }
-
-    std::cout << "Input tokens: " << tokenCount << '\n';
-    std::cout << "Input cluster occurrences: " << clusterCount << '\n';
-
-
-    bool hasInputClusters = false;
-
-    for (const auto& [key, frequency] : inputFeatures) {
-        if (key.first == "cluster" && frequency > 0) {
-            hasInputClusters = true;
-            break;
-        }
-    }
-
-    std::cout << "Input cluster features: "
-            << (hasInputClusters ? "Yes" : "No")
-            << '\n';
-
-    std::vector<EdgeMapCandidate> results;
-
-    if (inputFeatures.empty())
-        return results;
-
-    // Temporary per-query index. The reference database
-    // remains unchanged.
-    char* error = nullptr;
-
-    auto execute = [&](const char* sql) {
-        if (sqlite3_exec(db, sql, nullptr, nullptr, &error)
-            != SQLITE_OK) {
-            std::string message =
-                error ? error : "SQLite error";
-            sqlite3_free(error);
-            error = nullptr;
-            throw std::runtime_error(message);
-        }
-    };
-
-    execute(R"SQL(
-        CREATE TEMP TABLE IF NOT EXISTS input_features (
-            featureType TEXT NOT NULL,
-            featureID INTEGER NOT NULL,
-            frequency INTEGER NOT NULL,
-            PRIMARY KEY(featureType, featureID)
-        );
-        DELETE FROM input_features;
-    )SQL");
-
-    sqlite3_stmt* insert = nullptr;
-
-    const char* insertSQL = R"SQL(
-        INSERT INTO input_features
-            (featureType, featureID, frequency)
-        VALUES (?, ?, ?);
-    )SQL";
-
-    if (sqlite3_prepare_v2(db, insertSQL, -1, &insert, nullptr)
-        != SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(db));
-
-    try {
-        for (const auto& [key, count] : inputFeatures) {
-            sqlite3_bind_text(
-                insert, 1, key.first.c_str(),
-                -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(insert, 2, key.second);
-            sqlite3_bind_int(insert, 3, count);
-
-            if (sqlite3_step(insert) != SQLITE_DONE)
-                throw std::runtime_error(sqlite3_errmsg(db));
-
-            sqlite3_reset(insert);
-            sqlite3_clear_bindings(insert);
-        }
-    } catch (...) {
-        sqlite3_finalize(insert);
-        throw;
-    }
-
-    sqlite3_finalize(insert);
-
-    // Use the inverted feature index to find candidates.
-    // Calculate weighted Jaccard for each feature type.
-    const char* matchSQL = R"SQL(
-
-        
-
-
-        WITH candidate_maps AS (
-            SELECT DISTINCT ef.edgeMapID
-            FROM edge_map_features ef
-            JOIN input_features i
-              ON i.featureType = ef.featureType
-             AND i.featureID = ef.featureID
-        ),
-        totals AS (
-            SELECT
-                featureType,
-                SUM(frequency) AS total
-            FROM input_features
-            GROUP BY featureType
-        ),
-        reference_totals AS (
-            SELECT
-                ef.edgeMapID,
-                ef.featureType,
-                SUM(ef.frequency) AS total
-            FROM edge_map_features ef
-            JOIN candidate_maps cm
-              ON cm.edgeMapID = ef.edgeMapID
-            GROUP BY ef.edgeMapID, ef.featureType
-        ),
-        intersections AS (
-            SELECT
-                ef.edgeMapID,
-                ef.featureType,
-                SUM(MIN(ef.frequency, i.frequency)) AS overlap
-            FROM edge_map_features ef
-            JOIN input_features i
-              ON i.featureType = ef.featureType
-             AND i.featureID = ef.featureID
-            GROUP BY ef.edgeMapID, ef.featureType
-        ),
-        similarities AS (
-            SELECT
-                cm.edgeMapID,
-                typ.featureType,
-                CASE
-                    WHEN COALESCE(t.total, 0)
-                       + COALESCE(r.total, 0)
-                       - COALESCE(x.overlap, 0) = 0
-                    THEN 0.0
-                    ELSE
-                        1.0 * COALESCE(x.overlap, 0) /
-                        (
-                            COALESCE(t.total, 0)
-                          + COALESCE(r.total, 0)
-                          - COALESCE(x.overlap, 0)
-                        )
-                END AS similarity
-            FROM candidate_maps cm
-            CROSS JOIN (
-                SELECT 'token' AS featureType
-                UNION ALL
-                SELECT 'cluster'
-            ) typ
-            LEFT JOIN totals t
-              ON t.featureType = typ.featureType
-            LEFT JOIN reference_totals r
-              ON r.edgeMapID = cm.edgeMapID
-             AND r.featureType = typ.featureType
-            LEFT JOIN intersections x
-              ON x.edgeMapID = cm.edgeMapID
-             AND x.featureType = typ.featureType
-        )
-        SELECT
-            em.edgeMapID,
-            em.meshID,
-            em.imageID,
-            MAX(CASE WHEN s.featureType = 'token'
-                     THEN s.similarity ELSE 0 END),
-            MAX(CASE WHEN s.featureType = 'cluster'
-                     THEN s.similarity ELSE 0 END)
-        FROM similarities s
-        JOIN edge_maps em
-          ON em.edgeMapID = s.edgeMapID
-        GROUP BY em.edgeMapID, em.meshID, em.imageID;
-    )SQL";
-
-    sqlite3_stmt* stmt = nullptr;
-
-    if (sqlite3_prepare_v2(db, matchSQL, -1, &stmt, nullptr)
-        != SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(db));
-
-    try {
-        int rc;
-        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            EdgeMapCandidate candidate;
-
-            candidate.edgeMapID = sqlite3_column_int(stmt, 0);
-
-            candidate.meshID =
-                reinterpret_cast<const char*>(
-                    sqlite3_column_text(stmt, 1));
-
-            candidate.imageID =
-                reinterpret_cast<const char*>(
-                    sqlite3_column_text(stmt, 2));
-
-            candidate.tokenSimilarity =
-                sqlite3_column_double(stmt, 3);
-
-            candidate.clusterSimilarity =
-                sqlite3_column_double(stmt, 4);
-
-            if (hasInputClusters) {
-                candidate.score =
-                    0.30 * candidate.tokenSimilarity +
-                    0.70 * candidate.clusterSimilarity;
-            } else {
-                candidate.score = candidate.tokenSimilarity;
-            }
-
-            results.push_back(std::move(candidate));
-        }
-
-        if (rc != SQLITE_DONE)
-            throw std::runtime_error(sqlite3_errmsg(db));
-
-    } catch (...) {
-        sqlite3_finalize(stmt);
-        throw;
-    }
-
-    sqlite3_finalize(stmt);
-
-    if (!excludeMeshID.empty() && !excludeImageID.empty()) {
-        results.erase(
-            std::remove_if(
-                results.begin(),
-                results.end(),
-                [&](const EdgeMapCandidate& candidate) {
-                    return candidate.meshID == excludeMeshID &&
-                        candidate.imageID == excludeImageID;
-                }
-            ),
-            results.end()
-        );
-    }
-
-    std::sort(results.begin(), results.end(),
-        [](const EdgeMapCandidate& a,
-           const EdgeMapCandidate& b) {
-            if (a.score != b.score)
-                return a.score > b.score;
-            return a.edgeMapID < b.edgeMapID;
-        });
-
-    if (results.size() > topK)
-        results.resize(topK);
-
-    return results;
-}
-
-
-
-
-
-int main(int argc, char* argv[]) {
-
-    const fs::path datasetRoot =
-        R"(F:\CARLA set\sets\test_edges)";
-
-    const fs::path databasePath =
-        R"(F:\CARLA set\model\tokens.db)";
-
-    // ==========================================
-    // MODE 1: BUILD REFERENCE DATABASE
-    // ==========================================
-
-    if (argc > 1 &&
-        std::string(argv[1]) == "--build-database") {
-
-        try {
-            std::cout << "Loading dataset edges...\n";
-
-            auto functions = loadDatasetEdges(datasetRoot);
-
-            std::cout << "Functions loaded: "
-                      << functions.size() << '\n';
-
-            sqlite3* db = openDatabase(databasePath.string());
-
-            try {
-                std::cout << "Tokenizing functions...\n";
-
-                auto dataset = tokenizeFunctions(db, functions);
-
-                std::cout << "Unique tokens: "
-                          << dataset.patterns.size() << '\n';
-
-                saveTokenDataset(db, dataset, functions);
-
-                std::cout << "Building composite tokens...\n";
-                mergeTokens(db, 2);
-                encodeCompositeTokens(db);
-
-                std::cout << "Building token connectivity...\n";
-                objectLookup(db);
-
-                std::cout << "Grouping connected functions...\n";
-                groupConnectedNeighbors(db, 1, 5);
-
-                std::cout << "Building edge-map index...\n";
-                buildEdgeMapIndex(db);
-
-            } catch (...) {
-                sqlite3_close(db);
-                throw;
-            }
-
-            sqlite3_close(db);
-
-            std::cout << "Database successfully created!\n";
-            return 0;
-
-        } catch (const std::exception& e) {
-            std::cerr << "Database error: "
-                      << e.what() << '\n';
-            return 1;
-        }
-    }
-
-    // ==========================================
-    // MODE 2: CLASSIFY INPUT IMAGE
-    // ==========================================
-
+struct FunctionAssignment {
+    LineMatch match;
+    std::size_t matchingNeighbors;
+    double score;
+};
+
+struct ReferenceAssignments {
     std::string imagePath;
-    std::string outputPath;
+    std::vector<std::optional<FunctionAssignment>> byInput;
+    std::size_t matchedFunctions = 0;
+    std::size_t unmatchedFunctions = 0;
+    std::size_t remainingFunctions = 0;
+    double score = 0.0;
+};
 
-    for (int i = 1; i < argc; ++i) {
+ReferenceAssignments assignFunctions(
+    const std::string& referencePath,
+    const std::vector<functionData>& functions,
+    const std::unordered_map<int, std::size_t>& inputIndex,
+    const NeighborGraph& inputNeighbors,
+    const NeighborGraph& referenceNeighbors,
+    const LineCandidates& candidates
+) {
+    const std::size_t totalFunctions = functions.size();
+    ReferenceAssignments result;
+    result.imagePath = referencePath;
+    result.byInput.resize(totalFunctions);
+    result.remainingFunctions = totalFunctions;
 
-        std::string arg = argv[i];
+    std::vector<std::size_t> order(totalFunctions);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&candidates](std::size_t a, std::size_t b) {
+        return candidates[a].size() < candidates[b].size();
+    });
 
-        if (arg == "--input" && i + 1 < argc) {
-            imagePath = argv[++i];
+    std::unordered_set<int> assigned;
+    for (std::size_t index : order) {
+        const auto& neighbors = neighborsOf(inputNeighbors, functions[index].id);
+        auto& best = result.byInput[index];
+        for (const auto& candidate : candidates[index]) {
+            if (assigned.count(candidate.functionID))
+                continue;
+            const auto& reference = neighborsOf(referenceNeighbors, candidate.functionID);
+            const auto matched = std::max(
+                countMatchingNeighbors(neighbors, reference, inputIndex, candidates, false),
+                countMatchingNeighbors(neighbors, reference, inputIndex, candidates, true)
+            );
+            const double geometry = 1.0 - 0.5 * (
+                candidate.angleDifference / angleBucketWidth
+                + candidate.relativeLengthDifference / lengthTolerance
+            );
+            const double bonus = neighbors.empty() ? 0.0
+                : static_cast<double>(matched) / neighbors.size();
+            const double score = geometry + bonus;
+            if (!best || score > best->score)
+                best = FunctionAssignment{candidate, matched, score};
         }
-        else if (arg == "--output" && i + 1 < argc) {
-            outputPath = argv[++i];
+        if (best) {
+            assigned.insert(best->match.functionID);
+            ++result.matchedFunctions;
+            result.score += best->score;
+        } else {
+            ++result.unmatchedFunctions;
+        }
+        --result.remainingFunctions;
+    }
+    return result;
+}
+
+void searchImage(sqlite3* db, const std::string& imagePath) {
+    cv::Size imageSize;
+    const auto functions = encodeFunctions(imagePath, imageSize);
+    const double diagonal = std::hypot(imageSize.width, imageSize.height);
+    const std::size_t totalFunctions = functions.size();
+
+    std::unordered_map<int, std::size_t> inputIndex;
+    for (std::size_t i = 0; i < totalFunctions; ++i)
+        inputIndex.emplace(functions[i].id, i);
+
+    NeighborGraph inputNeighbors;
+    for (const auto& link : findFunctionNeighbors(functions)) {
+        const auto& anchor = functions[inputIndex.at(link.functionID)];
+        const auto& neighbor = functions[inputIndex.at(link.neighborID)];
+        inputNeighbors[link.functionID].push_back({
+            link.neighborID,
+            attachedEndpoints(anchor.start, anchor.end, neighbor.start, neighbor.end)
+        });
+    }
+
+    // Keep bucket candidates and neighbor rows on the same SQLite snapshot.
+    execute(db, "BEGIN;");
+    std::map<std::string, LineCandidates> byReference;
+    std::size_t candidateCount = 0;
+    for (std::size_t i = 0; i < totalFunctions; ++i) {
+        const auto descriptor = describeLine(functions[i], diagonal);
+        if (!descriptor)
+            continue;
+        auto matches = findSimilarLines(db, *descriptor);
+        candidateCount += matches.size();
+        for (auto& match : matches) {
+            auto entry = byReference.try_emplace(match.imagePath, totalFunctions).first;
+            entry->second[i].push_back(std::move(match));
         }
     }
 
-    if (imagePath.empty() || outputPath.empty()) {
-        std::cerr
-            << "Usage:\n"
-            << "  classifier.exe --build-database\n"
-            << "  classifier.exe --input IMAGE --output JSON\n";
+    std::vector<ReferenceAssignments> results;
+    for (const auto& [referencePath, candidates] : byReference) {
+        const auto referenceNeighbors = loadReferenceNeighbors(db, referencePath);
+        results.push_back(assignFunctions(
+            referencePath, functions, inputIndex, inputNeighbors, referenceNeighbors, candidates
+        ));
+    }
+    execute(db, "COMMIT;");
 
-        return 1;
+    std::stable_sort(results.begin(), results.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.matchedFunctions, a.score) > std::tie(b.matchedFunctions, b.score);
+    });
+
+    std::cout << "Search: " << totalFunctions << " input lines, "
+              << candidateCount << " candidate matches across "
+              << results.size() << " reference images.\n";
+    if (results.empty())
+        std::cout << "No reference candidates | Unmatched: " << totalFunctions << '\n';
+
+    for (const auto& result : results) {
+        std::cout << "Reference: " << std::quoted(result.imagePath)
+                  << " | Total: " << totalFunctions
+                  << " | Matched: " << result.matchedFunctions
+                  << " | Unmatched: " << result.unmatchedFunctions
+                  << " | Remaining: " << result.remainingFunctions
+                  << " | Score: " << result.score << '\n';
+        for (std::size_t i = 0; i < totalFunctions; ++i) {
+            const auto& assignment = result.byInput[i];
+            std::cout << "  Input function " << functions[i].id << " -> ";
+            if (!assignment) {
+                std::cout << "unmatched\n";
+                continue;
+            }
+            std::cout << "reference function " << assignment->match.functionID
+                      << " | Matching neighbors: " << assignment->matchingNeighbors
+                      << " | Angle difference: " << assignment->match.angleDifference << " deg"
+                      << " | Relative length difference: " << assignment->match.relativeLengthDifference
+                      << '\n';
+        }
+    }
+}
+
+class LineVocabulary {
+public:
+    void add(int tokenID, LineDescriptor descriptor) {
+        const int angle = static_cast<int>(descriptor.angleDegrees / angleBucketWidth);
+        const int length = static_cast<int>(descriptor.normalizedLength / lengthBucketWidth);
+        buckets_[{angle, length}].push_back({tokenID, descriptor});
     }
 
+    std::optional<int> lookup(LineDescriptor descriptor) const {
+        const auto range = lineBucketRange(descriptor);
+        std::optional<int> best;
+        double bestDistance = 0.0;
+        for (int angle : range.angles) {
+            auto bucket = buckets_.lower_bound({angle, range.minLength});
+            for (; bucket != buckets_.end() && bucket->first.first == angle
+                 && bucket->first.second <= range.maxLength; ++bucket) {
+                for (const auto& token : bucket->second) {
+                    const auto difference = compareLines(descriptor, token.descriptor);
+                    if (!difference)
+                        continue;
+                    const double distance = std::hypot(
+                        difference->angle / angleBucketWidth,
+                        difference->length / lengthTolerance
+                    );
+                    if (!best || std::tie(distance, token.id) < std::tie(bestDistance, *best)) {
+                        best = token.id;
+                        bestDistance = distance;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+private:
+    struct Token {
+        int id;
+        LineDescriptor descriptor;
+    };
+    std::map<std::pair<int, int>, std::vector<Token>> buckets_;
+};
+
+void buildLineVocabulary(sqlite3* db) {
+    execute(db, "PRAGMA foreign_keys = ON;");
+    execute(db, "BEGIN IMMEDIATE;");
+    int tokenCount = 0;
+    std::size_t occurrenceCount = 0;
     try {
-        // Step 1: Encode input image.
-        std::cout << "Encoding input image...\n";
+        execute(db, R"SQL(
+            CREATE TABLE IF NOT EXISTS line_tokens (
+                token_id INTEGER PRIMARY KEY,
+                angle_degrees REAL NOT NULL,
+                normalized_length REAL NOT NULL
+            );
 
-        json input = encodeImage(imagePath);
+            CREATE TABLE IF NOT EXISTS line_token_occurrences (
+                image_path TEXT NOT NULL,
+                function_id INTEGER NOT NULL,
+                token_id INTEGER NOT NULL,
+                PRIMARY KEY (image_path, function_id),
+                FOREIGN KEY (image_path, function_id)
+                    REFERENCES line_buckets(image_path, function_id) ON DELETE CASCADE,
+                FOREIGN KEY (token_id)
+                    REFERENCES line_tokens(token_id) ON DELETE CASCADE
+            );
 
-        // Step 2: Open reference database.
-        sqlite3* db = openDatabase(databasePath.string());
+            CREATE INDEX IF NOT EXISTS idx_line_token_occurrences_token
+                ON line_token_occurrences(token_id, image_path);
 
-        std::vector<EdgeMapCandidate> candidates;
+            DELETE FROM line_tokens;
+        )SQL");
 
-        try {
-            // Step 3: Find similar reference edge maps.
-            std::cout << "Matching reference edge maps...\n";
+        LineVocabulary vocabulary;
+        Statement lines(db, R"SQL(
+            SELECT image_path, function_id, angle_degrees, normalized_length
+            FROM line_buckets
+            ORDER BY image_path, function_id;
+        )SQL");
+        Statement insertToken(db, R"SQL(
+            INSERT INTO line_tokens (token_id, angle_degrees, normalized_length)
+            VALUES (?, ?, ?);
+        )SQL");
 
-            candidates = matchEdgeMaps(db, input, 10);
-
-        } catch (...) {
-            sqlite3_close(db);
-            throw;
+        // Create a representative for each line that no existing token covers.
+        while (lines.next()) {
+            auto* row = lines.get();
+            const LineDescriptor descriptor{
+                sqlite3_column_double(row, 2), sqlite3_column_double(row, 3)
+            };
+            if (vocabulary.lookup(descriptor))
+                continue;
+            vocabulary.add(++tokenCount, descriptor);
+            insertToken.bind(1, tokenCount);
+            insertToken.bind(2, descriptor.angleDegrees);
+            insertToken.bind(3, descriptor.normalizedLength);
+            insertToken.write();
         }
+        if (tokenCount == 0)
+            throw std::runtime_error("No bucketed lines to tokenize. Index the reference images first.");
 
-        sqlite3_close(db);
+        // Assign against the complete vocabulary, using the same rule as queries.
+        Statement references(db, R"SQL(
+            SELECT image_path, function_id, angle_degrees, normalized_length
+            FROM line_buckets;
+        )SQL");
+        Statement insertOccurrence(db, R"SQL(
+            INSERT INTO line_token_occurrences (image_path, function_id, token_id)
+            VALUES (?, ?, ?);
+        )SQL");
+        while (references.next()) {
+            auto* row = references.get();
+            const auto token = vocabulary.lookup({
+                sqlite3_column_double(row, 2), sqlite3_column_double(row, 3)
+            });
+            if (!token)
+                throw std::runtime_error("No token assigned to an indexed line.");
+            insertOccurrence.bind(1, std::string(
+                reinterpret_cast<const char*>(sqlite3_column_text(row, 0))));
+            insertOccurrence.bind(2, sqlite3_column_int(row, 1));
+            insertOccurrence.bind(3, *token);
+            insertOccurrence.write();
+            ++occurrenceCount;
+        }
+        execute(db, "COMMIT;");
+    } catch (...) {
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        throw;
+    }
 
-        // Step 4: Create JSON output for Python.
-        json output;
+    Statement common(db, R"SQL(
+        SELECT token_id, COUNT(*), COUNT(DISTINCT image_path)
+        FROM line_token_occurrences
+        GROUP BY token_id
+        HAVING COUNT(DISTINCT image_path) >= 2
+        ORDER BY COUNT(DISTINCT image_path) DESC, COUNT(*) DESC, token_id;
+    )SQL");
+    std::size_t commonCount = 0;
+    while (common.next()) {
+        auto* row = common.get();
+        ++commonCount;
+        std::cout << "Token " << sqlite3_column_int(row, 0)
+                  << " | Functions: " << sqlite3_column_int64(row, 1)
+                  << " | Reference images: " << sqlite3_column_int64(row, 2) << '\n';
+    }
+    std::cout << "Tokenizer: " << occurrenceCount << " lines, " << tokenCount
+              << " tokens, " << commonCount << " shared across at least two images.\n";
+}
 
-        output["inputImage"] = imagePath;
-        output["candidateCount"] = candidates.size();
-        output["candidates"] = json::array();
+LineVocabulary loadLineVocabulary(sqlite3* db) {
+    Statement table(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'line_tokens';");
+    if (!table.next())
+        throw std::runtime_error("No token vocabulary. Run --tokenize first.");
 
-        for (const auto& candidate : candidates) {
+    LineVocabulary vocabulary;
+    Statement tokens(db, "SELECT token_id, angle_degrees, normalized_length FROM line_tokens;");
+    if (!tokens.next())
+        throw std::runtime_error("No tokens found. Run --tokenize first.");
+    do {
+        auto* row = tokens.get();
+        vocabulary.add(sqlite3_column_int(row, 0), {
+            sqlite3_column_double(row, 1), sqlite3_column_double(row, 2)
+        });
+    } while (tokens.next());
+    return vocabulary;
+}
 
-            output["candidates"].push_back({
-                {"meshID", candidate.meshID},
-                {"imageID", candidate.imageID},
-                {"edgeMapID", candidate.edgeMapID},
-                {"score", candidate.score},
-                {"tokenSimilarity", candidate.tokenSimilarity},
-                {"clusterSimilarity", candidate.clusterSimilarity}
+void tokenizeImage(sqlite3* db, const std::string& imagePath) {
+    const auto vocabulary = loadLineVocabulary(db);
+    cv::Size imageSize;
+    const auto functions = encodeFunctions(imagePath, imageSize);
+    const double diagonal = std::hypot(imageSize.width, imageSize.height);
+    for (const auto& function : functions) {
+        const auto descriptor = describeLine(function, diagonal);
+        const auto token = descriptor ? vocabulary.lookup(*descriptor) : std::nullopt;
+        std::cout << "Function " << function.id << " | Component " << function.componentID
+                  << " | Path " << function.pathID << " | Token: ";
+        if (token)
+            std::cout << *token << '\n';
+        else
+            std::cout << "unknown\n";
+    }
+}
+
+
+enum class EditKind { Match, Substitute, Delete, Insert };
+
+struct EditStep {
+    EditKind kind;
+    std::optional<int> inputFunctionID;
+    std::optional<int> referenceFunctionID;
+};
+
+struct PathAlignment {
+    std::size_t distance;
+    std::vector<EditStep> steps;
+};
+
+PathAlignment alignTokenPaths(
+    const std::vector<PathToken>& input,
+    const std::vector<PathToken>& reference
+) {
+    const std::size_t n = input.size();
+    const std::size_t m = reference.size();
+    std::vector<std::vector<std::size_t>> cost(
+        n + 1, std::vector<std::size_t>(m + 1)
+    );
+
+    for (std::size_t i = 0; i <= n; ++i)
+        cost[i][0] = i;
+    for (std::size_t j = 0; j <= m; ++j)
+        cost[0][j] = j;
+
+    const auto sameToken = [&](std::size_t i, std::size_t j) {
+        return input[i].tokenID >= 0
+            && input[i].tokenID == reference[j].tokenID;
+    };
+
+    for (std::size_t i = 1; i <= n; ++i) {
+        for (std::size_t j = 1; j <= m; ++j) {
+            const std::size_t substitution = sameToken(i - 1, j - 1) ? 0 : 1;
+            cost[i][j] = std::min({
+                cost[i - 1][j] + 1,
+                cost[i][j - 1] + 1,
+                cost[i - 1][j - 1] + substitution
             });
         }
+    }
 
-        // Step 5: Save results.
-        std::ofstream file(outputPath);
+    PathAlignment result{cost[n][m], {}};
+    std::size_t i = n;
+    std::size_t j = m;
 
-        if (!file) {
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0) {
+            const bool same = sameToken(i - 1, j - 1);
+            if (cost[i][j] == cost[i - 1][j - 1] + (same ? 0 : 1)) {
+                result.steps.push_back({
+                    same ? EditKind::Match : EditKind::Substitute,
+                    input[i - 1].functionID,
+                    reference[j - 1].functionID
+                });
+                --i;
+                --j;
+                continue;
+            }
+        }
+
+        if (i > 0 && cost[i][j] == cost[i - 1][j] + 1) {
+            result.steps.push_back({
+                EditKind::Delete, input[--i].functionID, std::nullopt
+            });
+        } else {
+            result.steps.push_back({
+                EditKind::Insert, std::nullopt, reference[--j].functionID
+            });
+        }
+    }
+
+    std::reverse(result.steps.begin(), result.steps.end());
+    return result;
+}
+
+std::optional<LineComparison> compareLineGeometry(
+    const LineSegment& input,
+    const LineSegment& reference,
+    const std::vector<std::pair<LineSegment, LineSegment>>& pairedNeighbors = {}
+) {
+    const cv::Point2d a = input.end - input.start;
+    const cv::Point2d b = reference.end - reference.start;
+    const double inputLength = cv::norm(a);
+    const double referenceLength = cv::norm(b);
+
+    if (inputLength <= 1e-12 || referenceLength <= 1e-12)
+        return std::nullopt;
+
+    const double pi = std::acos(-1.0);
+    const double scale = referenceLength / inputLength;
+    const auto inputMidpoint = (input.start + input.end) * 0.5;
+    const auto referenceMidpoint = (reference.start + reference.end) * 0.5;
+
+    std::optional<LineComparison> best;
+
+    for (int direction : {1, -1}) {
+        const cv::Point2d target = b * static_cast<double>(direction);
+        const double cross = a.x * target.y - a.y * target.x;
+        const double rotation = std::atan2(cross, a.dot(target));
+
+        LineTransform transform{rotation, scale, {0.0, 0.0}};
+        transform.translation = referenceMidpoint - transform.apply(inputMidpoint);
+
+        // Example tuning: 45 degrees or a 2x scale change maxes out
+        // the corresponding part of the anchor cost.
+        const double angleCost = std::min(1.0, std::abs(rotation) / (pi / 4.0));
+        const double scaleCost = std::min(1.0, std::abs(std::log2(scale)));
+        const double anchorCost = 0.5 * (angleCost + scaleCost);
+
+        double cost = anchorCost;
+        if (!pairedNeighbors.empty()) {
+            double totalNeighborCost = 0.0;
+            for (const auto& [from, to] : pairedNeighbors) {
+                const auto start = transform.apply(from.start);
+                const auto end = transform.apply(from.end);
+
+                const double forward = cv::norm(start - to.start)
+                                     + cv::norm(end - to.end);
+                const double reverse = cv::norm(start - to.end)
+                                     + cv::norm(end - to.start);
+                const double meanError = 0.5 * std::min(forward, reverse);
+
+                // Full penalty at a mean error of 25% of the anchor length.
+                totalNeighborCost += std::min(1.0, meanError / (0.25 * referenceLength));
+            }
+
+            const double neighborCost = totalNeighborCost / pairedNeighbors.size();
+            cost = 0.85 * anchorCost + 0.15 * neighborCost;
+        }
+
+        if (!best || cost < best->substitutionCost)
+            best = LineComparison{transform, cost};
+    }
+
+    return best;
+}
+
+
+struct TokenPath {
+    std::vector<PathToken> tokens;
+    std::vector<LineSegment> geometry;
+};
+
+struct PatternImage {
+    std::vector<TokenPath> paths;
+    std::size_t lineCount = 0;
+};
+
+PatternImage encodeTokenPaths(const std::string& imagePath, const LineVocabulary& vocabulary) {
+    const auto edge = encodeImage(imagePath);
+    const double diagonal = std::hypot(edge.at("width").get<double>(),
+                                       edge.at("height").get<double>());
+    PatternImage image;
+    for (const auto& path : edge.at("piecewisePaths")) {
+        TokenPath run;
+        const auto finishRun = [&] {
+            if (!run.tokens.empty()) {
+                image.paths.push_back(std::move(run));
+                run = TokenPath{};
+            }
+        };
+
+        for (const auto& segment : path.at("segments")) {
+            if (segment.at("type") != "line") {
+                finishRun();
+                continue;
+            }
+            const auto& data = segment.at("data");
+            const auto point = [&data](const char* name) {
+                const auto& p = data.at(name);
+                return cv::Point2d(p.at(0).get<double>(), p.at(1).get<double>());
+            };
+            functionData line;
+            line.start = point("start");
+            line.end = point("end");
+            const auto descriptor = describeLine(line, diagonal);
+            if (!descriptor) {
+                finishRun();
+                continue;
+            }
+            run.tokens.push_back({
+                vocabulary.lookup(*descriptor).value_or(-1), data.at("id").get<int>()
+            });
+            run.geometry.push_back({line.start * (1.0 / diagonal), line.end * (1.0 / diagonal)});
+            ++image.lineCount;
+        }
+        finishRun();
+    }
+    return image;
+}
+
+double weightedPathDistance(const TokenPath& input, const TokenPath& reference) {
+    std::vector<double> previous(reference.tokens.size() + 1);
+    std::iota(previous.begin(), previous.end(), 0.0);
+    std::vector<double> current(previous.size());
+
+    for (std::size_t i = 0; i < input.tokens.size(); ++i) {
+        current[0] = static_cast<double>(i + 1);
+        for (std::size_t j = 0; j < reference.tokens.size(); ++j) {
+            const int token = input.tokens[i].tokenID;
+            double substitution = 0.0;
+            if (token < 0 || token != reference.tokens[j].tokenID) {
+                const auto geometry = compareLineGeometry(input.geometry[i], reference.geometry[j]);
+                substitution = geometry ? geometry->substitutionCost : 1.0;
+            }
+            current[j + 1] = std::min({
+                previous[j + 1] + 1.0, current[j] + 1.0, previous[j] + substitution
+            });
+        }
+        previous.swap(current);
+    }
+    return previous.back();
+}
+
+using CostMatrix = std::vector<std::vector<double>>;
+
+// Minimum-cost one-to-one assignment for a square matrix (Hungarian algorithm).
+// Padding rows or columns account for paths that occur in only one image.
+std::vector<std::size_t> minimumPathAssignment(const CostMatrix& costs) {
+    const std::size_t n = costs.size();
+    std::vector<double> rowPotential(n + 1), columnPotential(n + 1);
+    std::vector<std::size_t> columnOwner(n + 1), predecessor(n + 1);
+    for (std::size_t row = 1; row <= n; ++row) {
+        columnOwner[0] = row;
+        std::size_t column = 0;
+        std::vector<double> slack(n + 1, std::numeric_limits<double>::infinity());
+        std::vector<bool> visited(n + 1, false);
+        do {
+            visited[column] = true;
+            const std::size_t owner = columnOwner[column];
+            std::size_t next = 0;
+            double delta = std::numeric_limits<double>::infinity();
+            for (std::size_t j = 1; j <= n; ++j) {
+                if (visited[j])
+                    continue;
+                const double reduced = costs[owner - 1][j - 1]
+                    - rowPotential[owner] - columnPotential[j];
+                if (reduced < slack[j]) {
+                    slack[j] = reduced;
+                    predecessor[j] = column;
+                }
+                if (slack[j] < delta) {
+                    delta = slack[j];
+                    next = j;
+                }
+            }
+            for (std::size_t j = 0; j <= n; ++j) {
+                if (visited[j]) {
+                    rowPotential[columnOwner[j]] += delta;
+                    columnPotential[j] -= delta;
+                } else {
+                    slack[j] -= delta;
+                }
+            }
+            column = next;
+        } while (columnOwner[column] != 0);
+
+        do {
+            const std::size_t previous = predecessor[column];
+            columnOwner[column] = columnOwner[previous];
+            column = previous;
+        } while (column != 0);
+    }
+
+    std::vector<std::size_t> assignment(n);
+    for (std::size_t column = 1; column <= n; ++column)
+        assignment[columnOwner[column] - 1] = column - 1;
+    return assignment;
+}
+
+struct PatternResult {
+    std::string imagePath;
+    std::size_t referenceLines = 0;
+    std::size_t exactMatches = 0;
+    std::size_t edits = 0;
+    double weightedCost = 0.0;
+    double normalizedCost = 0.0;
+};
+
+PatternResult comparePatternImages(
+    const PatternImage& input, const PatternImage& reference, const std::string& imagePath
+) {
+    auto reversed = reference.paths;
+    for (auto& path : reversed) {
+        std::reverse(path.tokens.begin(), path.tokens.end());
+        std::reverse(path.geometry.begin(), path.geometry.end());
+    }
+    const std::size_t n = std::max(input.paths.size(), reference.paths.size());
+    CostMatrix ordinary(n, std::vector<double>(n));
+    CostMatrix weighted = ordinary;
+    std::vector<std::vector<std::size_t>> exact(n, std::vector<std::size_t>(n));
+    const auto countMatches = [](const PathAlignment& alignment) {
+        return static_cast<std::size_t>(std::count_if(
+            alignment.steps.begin(), alignment.steps.end(),
+            [](const EditStep& step) { return step.kind == EditKind::Match; }
+        ));
+    };
+
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < n; ++j) {
+            if (i >= input.paths.size() || j >= reference.paths.size()) {
+                const auto size = i < input.paths.size() ? input.paths[i].tokens.size()
+                                                       : reference.paths[j].tokens.size();
+                ordinary[i][j] = weighted[i][j] = static_cast<double>(size);
+                continue;
+            }
+            const auto& a = input.paths[i];
+            const auto& b = reference.paths[j];
+            const auto forward = alignTokenPaths(a.tokens, b.tokens);
+            const auto backward = alignTokenPaths(a.tokens, reversed[j].tokens);
+            ordinary[i][j] = static_cast<double>(std::min(forward.distance, backward.distance));
+            if (forward.distance == backward.distance)
+                exact[i][j] = std::max(countMatches(forward), countMatches(backward));
+            else
+                exact[i][j] = countMatches(forward.distance < backward.distance ? forward : backward);
+            weighted[i][j] = std::min(weightedPathDistance(a, b), weightedPathDistance(a, reversed[j]));
+        }
+    }
+
+    // Among equally short ordinary alignments, prefer more exact token matches.
+    CostMatrix ordinaryRanking = ordinary;
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < n; ++j)
+            ordinaryRanking[i][j] -= static_cast<double>(exact[i][j]) / (input.lineCount + 1.0);
+    }
+    const auto ordinaryAssignment = minimumPathAssignment(ordinaryRanking);
+    const auto weightedAssignment = minimumPathAssignment(weighted);
+    PatternResult result{imagePath, reference.lineCount};
+    for (std::size_t i = 0; i < n; ++i) {
+        result.edits += static_cast<std::size_t>(ordinary[i][ordinaryAssignment[i]]);
+        result.exactMatches += exact[i][ordinaryAssignment[i]];
+        result.weightedCost += weighted[i][weightedAssignment[i]];
+    }
+    result.normalizedCost = result.weightedCost / (input.lineCount + reference.lineCount);
+    return result;
+}
+
+void searchPatterns(sqlite3* db, const std::string& imagePath) {
+    execute(db, "BEGIN;");
+    const auto vocabulary = loadLineVocabulary(db);
+    const auto input = encodeTokenPaths(imagePath, vocabulary);
+    if (input.lineCount == 0)
+        throw std::runtime_error("The input image has no eligible line segments.");
+
+    using TokenAssignments = std::unordered_map<int, int>;
+    std::map<std::string, TokenAssignments> references;
+    Statement indexed(db, R"SQL(
+        SELECT b.image_path, b.function_id, o.token_id
+        FROM line_buckets AS b
+        LEFT JOIN line_token_occurrences AS o
+          ON o.image_path = b.image_path AND o.function_id = b.function_id;
+    )SQL");
+    while (indexed.next()) {
+        auto* row = indexed.get();
+        if (sqlite3_column_type(row, 2) == SQLITE_NULL)
+            throw std::runtime_error("Some reference lines have no assigned token. Rerun --tokenize.");
+        const std::string path = reinterpret_cast<const char*>(sqlite3_column_text(row, 0));
+        references[path].emplace(sqlite3_column_int(row, 1), sqlite3_column_int(row, 2));
+    }
+    execute(db, "COMMIT;");
+    if (references.empty())
+        throw std::runtime_error("No tokenized reference images found.");
+
+    std::vector<PatternResult> results;
+    for (const auto& [path, expected] : references) {
+        try {
+            const auto reference = path == imagePath ? input : encodeTokenPaths(path, vocabulary);
+            if (reference.lineCount != expected.size())
+                throw std::runtime_error("Indexed line count differs from the source image.");
+            for (const auto& run : reference.paths) {
+                for (const auto& line : run.tokens) {
+                    const auto stored = expected.find(line.functionID);
+                    if (stored == expected.end() || stored->second != line.tokenID)
+                        throw std::runtime_error("Source lines differ from the stored token assignments.");
+                }
+            }
+            results.push_back(comparePatternImages(input, reference, path));
+        } catch (const std::exception& error) {
+            throw std::runtime_error("Reference " + path + " | " + error.what());
+        }
+    }
+    std::sort(results.begin(), results.end(), [](const PatternResult& a, const PatternResult& b) {
+        if (a.normalizedCost != b.normalizedCost)
+            return a.normalizedCost < b.normalizedCost;
+        if (a.exactMatches != b.exactMatches)
+            return a.exactMatches > b.exactMatches;
+        return std::tie(a.edits, a.imagePath) < std::tie(b.edits, b.imagePath);
+    });
+    std::cout << "Pattern search: " << input.lineCount << " input lines across "
+              << input.paths.size() << " paths, " << results.size() << " reference images.\n";
+    for (const auto& result : results) {
+        std::cout << "Reference: " << std::quoted(result.imagePath)
+                  << " | Reference lines: " << result.referenceLines
+                  << " | Exact matches: " << result.exactMatches
+                  << " | Edits: " << result.edits
+                  << " | Weighted cost: " << result.weightedCost
+                  << " | Normalized cost: " << result.normalizedCost << '\n';
+    }
+}
+
+struct ObjectLine {
+    int id;
+    LineSegment geometry;
+    double length;
+    double weight = 1.0;
+};
+
+double objectFunctionLength(const LineSegment& geometry) {
+    if (!geometry.control)
+        return cv::norm(geometry.end - geometry.start);
+    double length = 0.0;
+    auto previous = geometry.start;
+    for (int sample = 1; sample <= 16; ++sample) {
+        const auto point = geometry.pointAt(sample / 16.0);
+        length += cv::norm(point - previous);
+        previous = point;
+    }
+    return length;
+}
+
+struct ObjectMatch {
+    std::size_t inputIndex;
+    std::size_t referenceIndex;
+    double error;
+};
+
+struct ObjectDetection {
+    std::string referencePath;
+    LineTransform transform;
+    std::vector<ObjectMatch> matches;
+    double score;
+};
+
+using ObjectNeighbors = std::unordered_map<int, std::unordered_set<int>>;
+
+double scoreObjectMatches(
+    const std::vector<ObjectMatch>& matches,
+    const std::vector<ObjectLine>& input,
+    const std::vector<ObjectLine>& reference,
+    const ObjectNeighbors& inputNeighbors,
+    const ObjectNeighbors& referenceNeighbors
+) {
+    double score = 0.0;
+    for (std::size_t i = 0; i < matches.size(); ++i) {
+        const auto& a = matches[i];
+        const auto& line = reference[a.referenceIndex];
+        score += line.weight / (1.0 + a.error);
+        const auto in = inputNeighbors.find(input[a.inputIndex].id);
+        const auto ref = referenceNeighbors.find(line.id);
+        if (in == inputNeighbors.end() || ref == referenceNeighbors.end())
+            continue;
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& b = matches[j];
+            if (in->second.count(input[b.inputIndex].id)
+                && ref->second.count(reference[b.referenceIndex].id))
+                score += 0.15;
+        }
+    }
+    return score;
+}
+
+std::vector<ObjectMatch> verifyObjectPlacement(
+    const LineTransform& transform,
+    const std::vector<ObjectLine>& input,
+    const std::vector<ObjectLine>& reference
+) {
+    constexpr double endpointTolerance = 5.0;
+    std::vector<ObjectMatch> candidates;
+    for (std::size_t j = 0; j < reference.size(); ++j) {
+        const auto start = transform.apply(reference[j].geometry.start);
+        const auto end = transform.apply(reference[j].geometry.end);
+        for (std::size_t i = 0; i < input.size(); ++i) {
+            const auto& line = input[i].geometry;
+            if (line.control.has_value() != reference[j].geometry.control.has_value())
+                continue;
+            const auto distanceSquared = [](cv::Point2d a, cv::Point2d b) {
+                const auto delta = a - b;
+                return delta.dot(delta);
+            };
+            double error = std::min(
+                std::max(distanceSquared(start, line.start), distanceSquared(end, line.end)),
+                std::max(distanceSquared(start, line.end), distanceSquared(end, line.start))
+            );
+            if (error <= endpointTolerance * endpointTolerance && line.control) {
+                double forward = 0.0, reversed = 0.0;
+                for (int sample = 0; sample <= 16; ++sample) {
+                    const double t = sample / 16.0;
+                    const auto point = transform.apply(reference[j].geometry.pointAt(t));
+                    forward = std::max(forward, distanceSquared(point, line.pointAt(t)));
+                    reversed = std::max(reversed, distanceSquared(point, line.pointAt(1.0 - t)));
+                }
+                error = std::min(forward, reversed);
+            }
+            if (error <= endpointTolerance * endpointTolerance)
+                candidates.push_back({i, j, std::sqrt(error)});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.error, a.inputIndex, a.referenceIndex)
+             < std::tie(b.error, b.inputIndex, b.referenceIndex);
+    });
+    std::vector<bool> usedInput(input.size()), usedReference(reference.size());
+    std::vector<ObjectMatch> matches;
+    for (const auto& match : candidates) {
+        if (usedInput[match.inputIndex] || usedReference[match.referenceIndex])
+            continue;
+        usedInput[match.inputIndex] = usedReference[match.referenceIndex] = true;
+        matches.push_back(match);
+    }
+    return matches;
+}
+
+std::vector<LineTransform> voteForObjectPlacements(
+    const std::vector<ObjectLine>& input, const std::vector<ObjectLine>& reference
+) {
+    struct Vote {
+        LineTransform transform;
+        std::size_t lastInput;
+        double support;
+        double lastWeight;
+        std::size_t count;
+    };
+    constexpr double positionBin = 8.0;
+    constexpr int rotationBins = 72;
+    constexpr double logScaleBin = 0.10;
+    constexpr std::size_t maxPlacementsPerView = 16;
+    const double turn = 2.0 * std::acos(-1.0);
+    // Anchor translation at the reference center to avoid origin-dependent voting.
+    cv::Point2d center;
+    for (const auto& line : reference)
+        center += (line.geometry.start + line.geometry.end) * 0.5;
+    center *= 1.0 / reference.size();
+
+    std::map<std::array<int, 4>, Vote> bins;
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const auto& a = input[i];
+        const auto inputDirection = a.geometry.end - a.geometry.start;
+        const auto midpoint = (a.geometry.start + a.geometry.end) * 0.5;
+        for (const auto& b : reference) {
+            if (a.geometry.control.has_value() != b.geometry.control.has_value())
+                continue;
+            const double scale = a.length / b.length;
+            if (scale < 0.25 || scale > 4.0)
+                continue;
+            const auto direction = b.geometry.end - b.geometry.start;
+            const auto referenceMidpoint = (b.geometry.start + b.geometry.end) * 0.5;
+            for (double sign : {1.0, -1.0}) {
+                const auto target = inputDirection * sign;
+                const double rotation = std::atan2(
+                    direction.x * target.y - direction.y * target.x, direction.dot(target)
+                );
+                LineTransform placement{rotation, scale, {}};
+                placement.translation = midpoint - placement.apply(referenceMidpoint);
+                if (a.geometry.control
+                    && cv::norm(placement.apply(b.geometry.pointAt(0.5)) - a.geometry.pointAt(0.5)) > 5.0)
+                    continue;
+                const auto location = placement.apply(center);
+                const auto key = std::array<int, 4>{
+                    static_cast<int>(std::lround(location.x / positionBin)),
+                    static_cast<int>(std::lround(location.y / positionBin)),
+                    (static_cast<int>(std::lround(rotation / turn * rotationBins))
+                        + rotationBins) % rotationBins,
+                    static_cast<int>(std::lround(std::log2(scale) / logScaleBin))
+                };
+                auto [it, inserted] = bins.try_emplace(key, Vote{placement, i, b.weight, b.weight, 1});
+                if (inserted)
+                    continue;
+                auto& vote = it->second;
+                if (vote.lastInput != i) {
+                    vote.lastInput = i;
+                    vote.lastWeight = 0.0;
+                    ++vote.count;
+                }
+                if (b.weight > vote.lastWeight) {
+                    vote.support += b.weight - vote.lastWeight;
+                    vote.lastWeight = b.weight;
+                }
+            }
+        }
+    }
+
+    std::vector<const Vote*> ranked;
+    for (const auto& entry : bins) {
+        if (entry.second.count >= 3)
+            ranked.push_back(&entry.second);
+    }
+    const auto limit = std::min(ranked.size(), maxPlacementsPerView);
+    std::partial_sort(ranked.begin(), ranked.begin() + limit, ranked.end(),
+        [](const Vote* a, const Vote* b) { return a->support > b->support; });
+    std::vector<LineTransform> placements;
+    for (std::size_t i = 0; i < limit; ++i)
+        placements.push_back(ranked[i]->transform);
+    return placements;
+}
+
+void searchObjects(sqlite3* db, const std::string& imagePath,
+                   const std::string& outputPath, const char* depthPath) {
+    constexpr std::size_t minSupport = 4;
+    constexpr double minCoverage = 0.35;
+    cv::Size imageSize;
+    const auto functions = encodeObjectFunctions(imagePath, imageSize);
+    std::vector<ObjectLine> input;
+    for (const auto& line : functions) {
+        LineSegment geometry{line.start, line.end};
+        if (line.isBezier)
+            geometry.control = line.control;
+        const double length = objectFunctionLength(geometry);
+        if (length > 0.0 && cv::norm(line.end - line.start) > 0.0)
+            input.push_back({line.id, geometry, length});
+    }
+    ObjectNeighbors inputNeighbors;
+    for (const auto& link : findFunctionNeighbors(functions))
+        inputNeighbors[link.functionID].insert(link.neighborID);
+
+    struct ReferenceView {
+        std::vector<ObjectLine> lines;
+        ObjectNeighbors neighbors;
+    };
+    std::map<std::string, ReferenceView> references;
+    // Score rarity by distinct meshes so repeated views of one mesh count once.
+    // Token assignments are optional. The geometry search also works before tokenization.
+    execute(db, "BEGIN;");
+    std::unordered_map<int, std::unordered_set<std::string>> tokenMeshes;
+    std::unordered_set<std::string> meshes;
+    std::map<std::pair<std::string, int>, int> tokens;
+    Statement table(db, "SELECT 1 FROM sqlite_master WHERE name = 'line_token_occurrences' AND type = 'table';");
+    if (table.next()) {
+        Statement assigned(db, "SELECT image_path, function_id, token_id FROM line_token_occurrences;");
+        while (assigned.next()) {
+            auto* row = assigned.get();
+            const std::string path = reinterpret_cast<const char*>(sqlite3_column_text(row, 0));
+            const auto mesh = std::filesystem::path(path).parent_path().parent_path().string();
+            const int token = sqlite3_column_int(row, 2);
+            tokens.emplace(std::make_pair(path, sqlite3_column_int(row, 1)), token);
+            tokenMeshes[token].insert(mesh);
+            meshes.insert(mesh);
+        }
+    }
+    Statement lines(db, R"SQL(
+        SELECT f.image_path, f.function_id, f.start_x, f.start_y, f.end_x, f.end_y
+        FROM image_functions f JOIN line_buckets b USING (image_path, function_id)
+        ORDER BY f.image_path, f.function_id;
+    )SQL");
+    while (lines.next()) {
+        auto* row = lines.get();
+        const std::string path = reinterpret_cast<const char*>(sqlite3_column_text(row, 0));
+        const int id = sqlite3_column_int(row, 1);
+        const LineSegment geometry{
+            {sqlite3_column_double(row, 2), sqlite3_column_double(row, 3)},
+            {sqlite3_column_double(row, 4), sqlite3_column_double(row, 5)}
+        };
+        const double length = cv::norm(geometry.end - geometry.start);
+        if (length <= 0.0)
+            continue;
+        double weight = 1.0;
+        const auto token = tokens.find({path, id});
+        if (token != tokens.end()) {
+            const auto frequency = tokenMeshes.at(token->second).size();
+            weight += 0.25 * std::log((meshes.size() + 1.0) / (frequency + 1.0));
+        }
+        references[path].lines.push_back({id, geometry, length, weight});
+    }
+    Statement edges(db, "SELECT image_path, function_id, neighbor_id FROM image_function_neighbors;");
+    while (edges.next()) {
+        auto* row = edges.get();
+        const auto path = reinterpret_cast<const char*>(sqlite3_column_text(row, 0));
+        const auto view = references.find(path);
+        if (view != references.end())
+            view->second.neighbors[sqlite3_column_int(row, 1)].insert(sqlite3_column_int(row, 2));
+    }
+    if (hasBezierTable(db)) {
+        Statement curves(db, R"SQL(
+            SELECT f.image_path, f.function_id, f.start_x, f.start_y, f.end_x, f.end_y,
+                   b.control_x, b.control_y
+            FROM image_functions f JOIN bezier_functions b USING (image_path, function_id)
+            ORDER BY f.image_path, f.function_id;
+        )SQL");
+        while (curves.next()) {
+            auto* row = curves.get();
+            const std::string path = reinterpret_cast<const char*>(sqlite3_column_text(row, 0));
+            LineSegment geometry{
+                {sqlite3_column_double(row, 2), sqlite3_column_double(row, 3)},
+                {sqlite3_column_double(row, 4), sqlite3_column_double(row, 5)},
+                cv::Point2d(sqlite3_column_double(row, 6), sqlite3_column_double(row, 7))
+            };
+            if (cv::norm(geometry.end - geometry.start) > 0.0)
+                references[path].lines.push_back({sqlite3_column_int(row, 1), geometry, objectFunctionLength(geometry)});
+        }
+        // Curves can be the only geometry in a view, so load their links after their views exist.
+        Statement links(db, "SELECT image_path, function_id, neighbor_id FROM image_function_neighbors WHERE function_id<0 OR neighbor_id<0;");
+        while (links.next()) {
+            const auto path = reinterpret_cast<const char*>(sqlite3_column_text(links.get(), 0));
+            const auto view = references.find(path);
+            if (view != references.end())
+                view->second.neighbors[sqlite3_column_int(links.get(), 1)].insert(sqlite3_column_int(links.get(), 2));
+        }
+    }
+    execute(db, "COMMIT;");
+
+    std::vector<ObjectDetection> candidates;
+    std::size_t scannedViews = 0;
+    for (const auto& [path, view] : references) {
+        if (++scannedViews % 100 == 0)
+            std::cout << "Object search: " << scannedViews << "/" << references.size()
+                      << " reference views checked" << std::endl;
+        if (view.lines.size() < minSupport || input.size() < minSupport)
+            continue;
+        for (const auto& transform : voteForObjectPlacements(input, view.lines)) {
+            auto matches = verifyObjectPlacement(transform, input, view.lines);
+            if (matches.size() < minSupport || matches.size() < minCoverage * view.lines.size())
+                continue;
+            const double score = scoreObjectMatches(
+                matches, input, view.lines, inputNeighbors, view.neighbors
+            );
+            candidates.push_back({path, transform, std::move(matches), score});
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return a.score > b.score;
+    });
+
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> depth(nullptr, sqlite3_close);
+    if (depthPath) {
+        sqlite3* connection = nullptr;
+        const int status = sqlite3_open_v2(depthPath, &connection, SQLITE_OPEN_READONLY, nullptr);
+        depth.reset(connection);
+        if (status != SQLITE_OK)
+            throw std::runtime_error(depth ? sqlite3_errmsg(depth.get()) : sqlite3_errstr(status));
+    }
+    nlohmann::json detections = nlohmann::json::array();
+    std::vector<bool> claimed(input.size());
+    for (const auto& candidate : candidates) {
+        const auto overlap = std::count_if(candidate.matches.begin(), candidate.matches.end(),
+            [&claimed](const ObjectMatch& match) { return claimed[match.inputIndex]; });
+        if (overlap != 0)
+            continue;
+
+        const auto& view = references.at(candidate.referencePath);
+        const auto path = std::filesystem::path(candidate.referencePath);
+        auto matches = nlohmann::json::array();
+        double left = imageSize.width, top = imageSize.height, right = 0.0, bottom = 0.0;
+        for (const auto& match : candidate.matches) {
+            claimed[match.inputIndex] = true;
+            const auto& line = input[match.inputIndex];
+            const int referenceId = view.lines[match.referenceIndex].id;
+            const int samples = line.geometry.control ? 16 : 1;
+            for (int sample = 0; sample <= samples; ++sample) {
+                const auto point = line.geometry.pointAt(static_cast<double>(sample) / samples);
+                left = std::min(left, point.x);
+                top = std::min(top, point.y);
+                right = std::max(right, point.x);
+                bottom = std::max(bottom, point.y);
+            }
+            nlohmann::json entry{
+                {"inputFunctionID", line.id}, {"referenceFunctionID", referenceId},
+                {"type", line.geometry.control ? "bezier" : "line"},
+                {"endpointErrorPixels", match.error}
+            };
+            if (line.geometry.control) {
+                entry["inputNativeCurveID"] = -line.id - 1;
+                entry["referenceNativeCurveID"] = -referenceId - 1;
+                entry["curveErrorPixels"] = match.error;
+            }
+            if (depth) {
+                Statement hits(depth.get(), R"SQL(
+                    SELECT token_id, points FROM token_depth_occurrences
+                    WHERE image_path = ? AND function_id = ?;
+                )SQL");
+                hits.bind(1, candidate.referencePath);
+                hits.bind(2, referenceId);
+                if (hits.next()) {
+                    entry["tokenID"] = sqlite3_column_int(hits.get(), 0);
+                    entry["referenceHits"] = nlohmann::json::parse(
+                        reinterpret_cast<const char*>(sqlite3_column_text(hits.get(), 1))
+                    );
+                }
+            }
+            matches.push_back(std::move(entry));
+        }
+        const auto& t = candidate.transform;
+        detections.push_back({
+            {"meshID", path.parent_path().parent_path().filename().string()},
+            {"referenceView", path.parent_path().filename().string()},
+            {"referenceImage", candidate.referencePath},
+            {"score", candidate.score},
+            {"referenceCoverage", static_cast<double>(matches.size()) / view.lines.size()},
+            {"boundsXYXY", {left, top, right, bottom}},
+            {"referenceToInput", {{"rotationRadians", t.rotationRadians}, {"scale", t.scale},
+                                  {"translation", {t.translation.x, t.translation.y}}}},
+            {"matches", std::move(matches)}
+        });
+    }
+    auto unassigned = nlohmann::json::array();
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (!claimed[i])
+            unassigned.push_back(input[i].id);
+    }
+    const nlohmann::json report{
+        {"inputImage", imagePath}, {"detections", detections}, {"unassignedFunctionIDs", unassigned},
+        {"inputFunctionCounts", {
+            {"lines", std::count_if(input.begin(), input.end(), [](const auto& f) { return !f.geometry.control; })},
+            {"bezier", std::count_if(input.begin(), input.end(), [](const auto& f) { return f.geometry.control.has_value(); })}
+        }}
+    };
+    std::ofstream output(outputPath);
+    if (!(output << report.dump(2) << '\n') || !(output.flush()))
+        throw std::runtime_error("Unable to write object detections to " + outputPath);
+    std::cout << "Object search: " << detections.size() << " detections, "
+              << unassigned.size() << " unassigned functions (lines and Bezier curves).\n";
+}
+
+int main(int argc, char* argv[]) {
+    const std::string mode = argc > 1 ? argv[1] : "";
+
+    const bool lookup = mode == "--lookup";
+    const bool search = mode == "--search";
+    const bool searchPatternsMode = mode == "--search-patterns";
+    const bool searchObjectsMode = mode == "--search-objects";
+    const bool buildDataset = mode == "--build-dataset";
+    const bool tokenize = mode == "--tokenize";
+    const bool refreshCurves = mode == "--refresh-curves";
+    const bool tokenizeQuery = mode == "--tokenize-image";
+    const bool indexSingle = !mode.empty() && mode.rfind("--", 0) != 0;
+
+    const bool validArgs =
+        (lookup && argc == 5) ||
+        (searchObjectsMode && (argc == 5 || argc == 6)) ||
+        ((search || searchPatternsMode || buildDataset || tokenizeQuery)
+            && argc == 4) ||
+        ((indexSingle || tokenize || refreshCurves) && argc == 3);
+
+    if (!validArgs) {
+        std::cerr
+            << "Usage:\n"
+            << "  classifierModel IMAGE DATABASE\n"
+            << "  classifierModel --build-dataset DATASET_ROOT DATABASE\n"
+            << "  classifierModel --search IMAGE DATABASE\n"
+            << "  classifierModel --search-patterns IMAGE DATABASE\n"
+            << "  classifierModel --search-objects IMAGE DATABASE OUTPUT_JSON [DEPTH_DATABASE]\n"
+            << "  classifierModel --lookup IMAGE DATABASE FUNCTION_ID\n"
+            << "  classifierModel --tokenize DATABASE\n"
+            << "  classifierModel --refresh-curves DATABASE\n"
+            << "  classifierModel --tokenize-image IMAGE DATABASE\n";
+        return 1;
+    }
+
+    try {
+        const int firstArg = indexSingle ? 1 : 2;
+        const std::string inputPath =
+            (tokenize || refreshCurves) ? "" : normalizePath(argv[firstArg]);
+        const char* databasePath = argv[(tokenize || refreshCurves) ? 2 : firstArg + 1];
+
+        int flags = SQLITE_OPEN_READONLY;
+        if (tokenize || refreshCurves) {
+            flags = SQLITE_OPEN_READWRITE;
+        } else if (buildDataset || indexSingle) {
+            flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+        }
+
+        sqlite3* connection = nullptr;
+        const int status = sqlite3_open_v2(
+            databasePath, &connection, flags, nullptr
+        );
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)>
+            db(connection, sqlite3_close);
+
+        if (status != SQLITE_OK) {
             throw std::runtime_error(
-                "Unable to open classification output file"
+                db ? sqlite3_errmsg(db.get()) : sqlite3_errstr(status)
             );
         }
 
-        file << output.dump(2);
-        file.close();
+        if (refreshCurves) {
+            return refreshReferenceCurves(db.get());
+        } else if (tokenize) {
+            buildLineVocabulary(db.get());
+        } else if (tokenizeQuery) {
+            tokenizeImage(db.get(), inputPath);
+        } else if (searchPatternsMode) {
+            searchPatterns(db.get(), inputPath);
+        } else if (searchObjectsMode) {
+            const auto output = normalizePath(argv[4]);
+            const auto sameFile = [&output](const std::string& path) {
+                std::error_code error;
+                return output == normalizePath(path)
+                    || std::filesystem::equivalent(output, path, error);
+            };
+            if (sameFile(databasePath) || sameFile(inputPath)
+                || (argc == 6 && sameFile(argv[5])))
+                throw std::runtime_error("OUTPUT_JSON must be separate from the input files.");
+            searchObjects(db.get(), inputPath, argv[4], argc == 6 ? argv[5] : nullptr);
+        } else if (search) {
+            searchImage(db.get(), inputPath);
+        } else if (lookup) {
+            const std::string argument = argv[4];
+            std::size_t parsed = 0;
+            const int functionID = std::stoi(argument, &parsed);
 
-        // Step 6: Print results for debugging.
-        std::cout << "\nClassification results:\n";
+            if (parsed != argument.size())
+                throw std::runtime_error("FUNCTION_ID must be an integer (negative IDs identify Bezier curves).");
 
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            const auto& candidate = candidates[i];
+            Statement exists(db.get(), R"SQL(
+                SELECT 1 FROM image_functions
+                WHERE image_path = ? AND function_id = ?;
+            )SQL");
+            exists.bind(1, inputPath);
+            exists.bind(2, functionID);
 
-            std::cout
-                << i + 1
-                << ". Mesh: " << candidate.meshID
-                << " | Image: " << candidate.imageID
-                << " | Score: " << candidate.score
-                << " | Tokens: " << candidate.tokenSimilarity
-                << " | Clusters: " << candidate.clusterSimilarity
-                << '\n';
+            if (!exists.next())
+                throw std::runtime_error("No stored function with that ID for this image.");
+
+            const auto neighbors =
+                lookupFunctionNeighbors(db.get(), inputPath, functionID);
+            std::cout << "Function " << functionID << " has "
+                      << neighbors.size() << " neighbors.\n";
+
+            for (const auto& neighbor : neighbors) {
+                printFunction(neighbor.function);
+                std::cout << "  Endpoint distance: "
+                          << neighbor.distancePixels << " px\n";
+            }
+        } else {
+            initializeFunctionTables(db.get());
+            initializeLineBuckets(db.get());
+
+            if (buildDataset)
+                return processDataset(db.get(), inputPath);
+
+            indexImage(db.get(), inputPath, true);
         }
-
-        std::cout
-            << "\nResults exported to: "
-            << outputPath << '\n';
-
-        return 0;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Classification error: "
-                  << e.what() << '\n';
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
         return 1;
     }
+
+    return 0;
 }
