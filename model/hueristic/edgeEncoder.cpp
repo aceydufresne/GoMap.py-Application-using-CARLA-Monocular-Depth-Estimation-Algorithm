@@ -5,6 +5,7 @@
 #include <opencv2/geometry/2d.hpp>
 
 #include <iostream>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <tuple>
@@ -24,10 +25,22 @@
 #include <variant>
 
 #include <filesystem>
+#include <chrono>
+#include <sstream>
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <stdexcept>
 #include "edgeEncoder.h"
+
+#if defined(_WIN32) && !defined(EDGE_ENCODER_LIBRARY)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#include <opencv2/core/ocl.hpp>
+#endif
+
 using json = nlohmann::json;
 
 
@@ -1277,6 +1290,13 @@ void saveMetadata(
 
 
 
+std::vector<piecewiseData> mergeCollinearFunctions(
+    const std::vector<piecewiseData>& input,
+    double maxEndpointGap = 5.0,
+    double maxAngleDegrees = 10.0,
+    double pixelTolerance = 1.5,
+    double minAccuracy = 0.85);
+
 nlohmann::json encodeImage(const std::string& imagePath) {
 
     cv::Mat skeleton = sobelEdgeDetector(imagePath);
@@ -1326,7 +1346,7 @@ nlohmann::json encodeImage(const std::string& imagePath) {
         createCurve(graphs, functions, image);
 
     std::vector<piecewiseData> pieces =
-        reduceEdges(graphs, functions, curves);
+        mergeCollinearFunctions(reduceEdges(graphs, functions, curves));
 
     std::vector<silhouette> outlines =
         getOutline(graphs, functions, curves, image);
@@ -1388,131 +1408,402 @@ nlohmann::json encodeImage(const std::string& imagePath) {
 
 
 
-namespace fs = std::filesystem;
-#ifndef EDGE_ENCODER_LIBRARY
-int main() {
-    fs::path inputRoot = R"(F:\CARLA set\renders\github)";
-    fs::path outputRoot = R"(F:\CARLA set\sets\test_edges)";
+// Merge collinear line fragments, including fragments from different paths.
+// Curves remain untouched. Merged lines retain the first segment's ID/path.
+std::vector<piecewiseData> mergeCollinearFunctions(
+    const std::vector<piecewiseData>& input,
+    double maxEndpointGap,
+    double maxAngleDegrees,
+    double pixelTolerance,
+    double minAccuracy)
+{
+    struct Entry {
+        funcData line;
+        size_t pieceIndex;
+        size_t segmentIndex;
+        bool active = true;
+    };
+    std::vector<Entry> entries;
+    for (size_t p = 0; p < input.size(); ++p)
+        for (size_t i = 0; i < input[p].segments.size(); ++i)
+            if (std::holds_alternative<funcData>(input[p].segments[i]))
+                entries.push_back({std::get<funcData>(input[p].segments[i]), p, i, true});
 
-    const int maxImages = 20;
-    int processed = 0;
-    int failed = 0;
+    auto endpointDistance = [](const funcData& a, const funcData& b) {
+        return std::min({cv::norm(a.start - b.start),
+                         cv::norm(a.start - b.end),
+                         cv::norm(a.end - b.start),
+                         cv::norm(a.end - b.end)});
+    };
 
-    try {
-        for (const auto& entry :
-             fs::recursive_directory_iterator(inputRoot)) {
+    auto fitCombined = [&](const funcData& a, const funcData& b, funcData& merged) {
+        std::vector<cv::Point> pixels = a.pixels;
+        pixels.insert(pixels.end(), b.pixels.begin(), b.pixels.end());
+        if (pixels.size() < 2) return false;
 
-            if (processed >= maxImages)
-                break;
+        // A shared fitted line must explain the actual pixels, not just endpoints.
+        cv::Vec4f fitted;
+        cv::fitLine(pixels, fitted, cv::DIST_L2, 0, 0.01, 0.01);
+        cv::Point2d direction(fitted[0], fitted[1]);
+        cv::Point2d origin(fitted[2], fitted[3]);
+        if (cv::norm(direction) < 1e-9) return false;
+        double A = -direction.y, B = direction.x;
+        double C = -(A * origin.x + B * origin.y);
 
-            if (!entry.is_regular_file())
-                continue;
+        size_t matching = 0;
+        double maximumResidual = 0.0;
+        for (const auto& pt : pixels) {
+            double residual = std::abs(A * pt.x + B * pt.y + C);
+            if (residual <= pixelTolerance) ++matching;
+            maximumResidual = std::max(maximumResidual, residual);
+        }
+        double accuracy = static_cast<double>(matching) / pixels.size();
+        if (accuracy < minAccuracy || maximumResidual > 2.0 * pixelTolerance)
+            return false;
 
-            fs::path imagePath = entry.path();
-
-            if (imagePath.extension() != ".png")
-                continue;
-
-            fs::path relativePath =
-                fs::relative(imagePath, inputRoot);
-
-            fs::path outputPath = outputRoot / relativePath;
-            outputPath.replace_extension(".json");
-
-            std::cout << "\nProcessing: "
-                      << imagePath << std::endl;
-
-            try {
-
-                cv::Mat skeleton =
-                    sobelEdgeDetector(imagePath.string());
-
-                if (skeleton.empty())
-                    throw std::runtime_error("Empty skeleton");
-
-                imageData image;
-                image.originalImage = cv::imread(imagePath.string());
-
-                if (image.originalImage.empty())
-                    throw std::runtime_error("Image load failed");
-
-                image.width = image.originalImage.cols;
-                image.height = image.originalImage.rows;
-                image.skeleton = skeleton;
-
-                std::vector<EdgeData> components =
-                    groupPixels(skeleton);
-
-                std::vector<EdgeGraph> graphs = map(components);
-
-                for (EdgeGraph& graph : graphs) {
-                    if (graph.nodes.empty())
-                        continue;
-
-                    int startNode = 0;
-
-                    for (int i = 0;
-                         i < static_cast<int>(graph.nodes.size());
-                         i++) {
-
-                        if (graph.nodes[i].neighbors.size() == 1) {
-                            startNode = i;
-                            break;
-                        }
-                    }
-
-                    graph.paths = findPaths(graph, startNode);
-                }
-
-                std::vector<funcData> functions =
-                    drawLine(graphs, image);
-
-                std::vector<bezierData> curves =
-                    createCurve(graphs, functions, image);
-
-                std::vector<piecewiseData> pieces =
-                    reduceEdges(graphs, functions, curves);
-
-                std::vector<silhouette> outlines =
-                    getOutline(graphs, functions, curves, image);
-
-                metaData metrics = getData(graphs, image);
-
-                saveMetadata(
-                    outputPath,
-                    imagePath.string(),
-                    image,
-                    graphs,
-                    functions,
-                    curves,
-                    pieces,
-                    outlines,
-                    metrics
-                );
-
-                ++processed;
-
-                std::cout << "Saved " << processed
-                          << "/" << maxImages
-                          << ": " << outputPath << std::endl;
-
-            } catch (const std::exception& e) {
-                ++failed;
-                std::cerr << "Failed: " << imagePath
-                          << " | " << e.what() << std::endl;
+        // Reject a merger if either sufficiently long fragment bends away
+        // from the common line. Short (1-3 px) fragments have noisy angles.
+        for (const funcData* f : {&a, &b}) {
+            cv::Point2d v = cv::Point2d(f->end - f->start);
+            double length = cv::norm(v);
+            if (length >= 5.0) {
+                double cosine = std::abs(v.dot(direction) / length);
+                cosine = std::clamp(cosine, 0.0, 1.0);
+                if (std::acos(cosine) * 180.0 / CV_PI > maxAngleDegrees)
+                    return false;
             }
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Dataset traversal error: "
-                  << e.what() << std::endl;
-        return 1;
+
+        // Endpoints of the merged segment are the extremes along its axis.
+        auto projection = [&](const cv::Point& pt) {
+            return (pt.x - origin.x) * direction.x +
+                   (pt.y - origin.y) * direction.y;
+        };
+        auto extremes = std::minmax_element(pixels.begin(), pixels.end(),
+            [&](const cv::Point& x, const cv::Point& y) {
+                return projection(x) < projection(y);
+            });
+        merged = a;
+        merged.a = A;
+        merged.b = B;
+        merged.c = C;
+        merged.accuracy = accuracy;
+        merged.start = *extremes.first;
+        merged.end = *extremes.second;
+        merged.pixels = std::move(pixels);
+        return true;
+    };
+
+    // Greedily merge the closest compatible pair and re-fit after every merge.
+    int merges = 0;
+    while (true) {
+        double bestGap = maxEndpointGap + 1.0;
+        size_t bestA = entries.size(), bestB = entries.size();
+        funcData bestFit;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (!entries[i].active) continue;
+            for (size_t j = i + 1; j < entries.size(); ++j) {
+                if (!entries[j].active ||
+                    entries[i].line.edgeID != entries[j].line.edgeID) continue;
+                double gap = endpointDistance(entries[i].line, entries[j].line);
+                if (gap > maxEndpointGap || gap >= bestGap) continue;
+                funcData candidate;
+                if (!fitCombined(entries[i].line, entries[j].line, candidate))
+                    continue;
+                bestGap = gap;
+                bestA = i;
+                bestB = j;
+                bestFit = std::move(candidate);
+            }
+        }
+        if (bestA == entries.size()) break;
+        std::cout << "Merging line " << entries[bestA].line.id
+                  << " with line " << entries[bestB].line.id
+                  << " | endpoint gap " << bestGap << " px\n";
+        entries[bestA].line = std::move(bestFit);
+        entries[bestB].active = false;
+        ++merges;
     }
 
-    std::cout << "\nCompleted!"
-              << "\nImages saved: " << processed
-              << "\nImages failed: " << failed
-              << std::endl;
+    // Reconstruct the piecewise paths, retaining every Bezier unchanged.
+    std::vector<piecewiseData> output = input;
+    for (auto& piece : output) piece.segments.clear();
+    for (size_t p = 0; p < input.size(); ++p) {
+        for (size_t i = 0; i < input[p].segments.size(); ++i) {
+            const auto& segment = input[p].segments[i];
+            if (std::holds_alternative<bezierData>(segment))
+                output[p].segments.push_back(segment);
+            else {
+                for (const auto& entry : entries) {
+                    if (entry.active && entry.pieceIndex == p &&
+                        entry.segmentIndex == i) {
+                        output[p].segments.push_back(entry.line);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    output.erase(std::remove_if(output.begin(), output.end(),
+        [](const piecewiseData& piece) { return piece.segments.empty(); }),
+        output.end());
+    std::cout << "Collinear merges: " << merges
+              << " | Final line segments: "
+              << std::count_if(entries.begin(), entries.end(),
+                    [](const Entry& e) { return e.active; }) << '\n';
+    return output;
+}
 
+// Display final piecewise functions and print the exact assigned colors.
+void displayColoredFunctions(const imageData& image,
+                             const std::vector<piecewiseData>& pieces) {
+    if (image.originalImage.empty()) return;
+    cv::Mat canvas = image.originalImage.clone();
+    if (canvas.channels() == 1)
+        cv::cvtColor(canvas, canvas, cv::COLOR_GRAY2BGR);
+    else if (canvas.channels() == 4)
+        cv::cvtColor(canvas, canvas, cv::COLOR_BGRA2BGR);
+
+    cv::RNG rng(12345); // Reproducible colors across runs
+    int displayed = 0;
+    std::cout << "\n=== Displayed geometric functions (RGB) ===\n";
+    for (const auto& piece : pieces) {
+        for (const auto& segment : piece.segments) {
+            cv::Scalar color(rng.uniform(40, 256), rng.uniform(40, 256),
+                             rng.uniform(40, 256)); // BGR in OpenCV
+            std::cout << "Function " << displayed
+                      << " | Component " << piece.edgeID
+                      << " | Path " << piece.pathID;
+            if (std::holds_alternative<funcData>(segment)) {
+                const auto& f = std::get<funcData>(segment);
+                cv::line(canvas, f.start, f.end, color, 2, cv::LINE_AA);
+                std::cout << " | Line ID " << f.id
+                          << " | " << f.a << "x + (" << f.b
+                          << ")y + (" << f.c << ") = 0"
+                          << " | Start (" << f.start.x << ", " << f.start.y << ")"
+                          << " | End (" << f.end.x << ", " << f.end.y << ")";
+            } else {
+                const auto& c = std::get<bezierData>(segment);
+                constexpr int samples = 100;
+                cv::Point previous = c.p0;
+                for (int i = 1; i <= samples; ++i) {
+                    double t = static_cast<double>(i) / samples;
+                    double u = 1.0 - t;
+                    cv::Point2d pt = (u*u)*c.p0 + (2*u*t)*c.p1 + (t*t)*c.p2;
+                    cv::Point next(cvRound(pt.x), cvRound(pt.y));
+                    cv::line(canvas, previous, next, color, 2, cv::LINE_AA);
+                    previous = next;
+                }
+                std::cout << " | Bezier ID " << c.id
+                          << " | P0 (" << c.p0.x << ", " << c.p0.y << ")"
+                          << " | P1 (" << c.p1.x << ", " << c.p1.y << ")"
+                          << " | P2 (" << c.p2.x << ", " << c.p2.y << ")";
+            }
+            std::cout << " | RGB (" << static_cast<int>(color[2])
+                      << ", " << static_cast<int>(color[1])
+                      << ", " << static_cast<int>(color[0]) << ")\n";
+            ++displayed;
+        }
+    }
+    std::cout << "Total displayed functions: " << displayed << '\n';
+    cv::imshow("Colored geometric functions", canvas);
+    cv::waitKey(0);
+    cv::destroyWindow("Colored geometric functions");
+}
+
+
+#include "edgeEncoder.h"
+
+std::vector<functionData> encodeFunctions(const std::string& imagePath) {
+    cv::Size imageSize;
+    return encodeFunctions(imagePath, imageSize);
+}
+
+std::vector<functionData> extractFunctions(const std::string& imagePath, cv::Size& imageSize, bool includeCurves) {
+    std::vector<functionData> functions;
+    const nlohmann::json encoded = encodeImage(imagePath);
+    imageSize = cv::Size(encoded.at("width").get<int>(), encoded.at("height").get<int>());
+
+    for (const auto& path : encoded.at("piecewisePaths")) {
+        int componentID = path.at("edgeID").get<int>();
+        int pathID = path.at("pathID").get<int>();
+
+        for (const auto& segment : path.at("segments")) {
+
+            const bool isBezier = segment.at("type") == "bezier";
+            if (segment.at("type") != "line" && !(includeCurves && isBezier))
+                continue;
+
+            const auto& data = segment.at("data");
+
+            functionData function;
+
+            function.id = data.at("id").get<int>();
+            function.componentID = componentID;
+            function.pathID = pathID;
+
+            if (isBezier) {
+                const int nativeID = data.at("id").get<int>();
+                if (nativeID < 0 || nativeID == std::numeric_limits<int>::max())
+                    throw std::runtime_error("Invalid Bezier function ID");
+                function.id = -nativeID - 1;
+                function.isBezier = true;
+                function.start = {data.at("p0")[0].get<double>(), data.at("p0")[1].get<double>()};
+                function.control = {data.at("p1")[0].get<double>(), data.at("p1")[1].get<double>()};
+                function.end = {data.at("p2")[0].get<double>(), data.at("p2")[1].get<double>()};
+                functions.push_back(function);
+                continue;
+            }
+
+            function.a = data.at("a").get<double>();
+            function.b = data.at("b").get<double>();
+            function.c = data.at("c").get<double>();
+
+            function.start = cv::Point2d(
+                data.at("start")[0].get<double>(),
+                data.at("start")[1].get<double>()
+            );
+
+            function.end = cv::Point2d(
+                data.at("end")[0].get<double>(),
+                data.at("end")[1].get<double>()
+            );
+
+            functions.push_back(function);
+        }
+    }
+
+    return functions;
+}
+
+
+std::vector<functionData> encodeFunctions(const std::string& imagePath, cv::Size& imageSize) {
+    return extractFunctions(imagePath, imageSize, false);
+}
+
+std::vector<functionData> encodeObjectFunctions(const std::string& imagePath, cv::Size& imageSize) {
+    return extractFunctions(imagePath, imageSize, true);
+}
+
+
+
+namespace fs = std::filesystem;
+#ifndef EDGE_ENCODER_LIBRARY
+#ifdef _WIN32
+double processCpuMilliseconds() {
+    FILETIME creation, exit, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+        throw std::runtime_error("GetProcessTimes failed");
+    const auto ticks = [](FILETIME time) {
+        return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32)
+            | time.dwLowDateTime;
+    };
+    return (ticks(kernel) + ticks(user)) / 10000.0;
+}
+
+void profileEncoder(int argc, char* argv[]) {
+    if (argc < 3)
+        throw std::invalid_argument("Usage: edgeEncoder --profile IMAGE [IMAGE ...]");
+
+    cv::setNumThreads(1);
+    cv::ocl::setUseOpenCL(false);
+    std::ostringstream diagnostics;
+    auto* console = std::cout.rdbuf(diagnostics.rdbuf());
+    const auto encode = [&diagnostics](const char* path) {
+        diagnostics.str("");
+        return encodeImage(path);
+    };
+    json samples = json::array();
+    double cpuMilliseconds;
+    try {
+        encode(argv[2]);
+        const double startCpu = processCpuMilliseconds();
+        for (int i = 2; i < argc; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            encode(argv[i]);
+            const double elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            samples.push_back({{"image", argv[i]}, {"wall_ms", elapsed}});
+        }
+        cpuMilliseconds = processCpuMilliseconds() - startCpu;
+    } catch (...) {
+        std::cout.rdbuf(console);
+        throw;
+    }
+    std::cout.rdbuf(console);
+
+    PROCESS_MEMORY_COUNTERS memory{};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory)))
+        throw std::runtime_error("GetProcessMemoryInfo failed");
+    const json profile{
+        {"pipeline", "edge_encoder"}, {"device", "cpu"}, {"threads", 1},
+        {"cpu_ms", cpuMilliseconds},
+        {"peak_working_set_bytes", memory.PeakWorkingSetSize},
+        {"samples", std::move(samples)}
+    };
+    std::cout << profile.dump() << '\n';
+}
+#endif
+
+int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "--profile") {
+        try {
+#ifdef _WIN32
+            profileEncoder(argc, argv);
+            return 0;
+#else
+            throw std::runtime_error("--profile requires Windows process counters");
+#endif
+        } catch (const std::exception& error) {
+            std::cerr << "Error: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    // Edit this path if your Downloads directory is elsewhere.
+    const char* profile = std::getenv("USERPROFILE");
+    if (!profile) {
+        std::cerr << "USERPROFILE environment variable not found\n";
+        return 1;
+    }
+    fs::path imagePath = fs::path(profile) / "Downloads" / "triangle2.png";
+    fs::path outputPath = R"(F:\CARLA\sets\test_edges\cubeExample.json)";
+    try {
+        std::cout << "Processing: " << imagePath << '\n';
+        cv::Mat skeleton = sobelEdgeDetector(imagePath.string());
+        if (skeleton.empty()) throw std::runtime_error("Empty skeleton");
+        imageData image;
+        image.originalImage = cv::imread(imagePath.string());
+        if (image.originalImage.empty()) throw std::runtime_error("Image load failed");
+        image.width = image.originalImage.cols;
+        image.height = image.originalImage.rows;
+        image.skeleton = skeleton;
+        std::vector<EdgeData> components = groupPixels(skeleton);
+        std::vector<EdgeGraph> graphs = map(components);
+        for (EdgeGraph& graph : graphs) {
+            if (graph.nodes.empty()) continue;
+            int startNode = 0;
+            for (int i = 0; i < static_cast<int>(graph.nodes.size()); ++i) {
+                if (graph.nodes[i].neighbors.size() == 1) {
+                    startNode = i;
+                    break;
+                }
+            }
+            graph.paths = findPaths(graph, startNode);
+        }
+        std::vector<funcData> functions = drawLine(graphs, image);
+        std::vector<bezierData> curves = createCurve(graphs, functions, image);
+        std::vector<piecewiseData> pieces =
+            mergeCollinearFunctions(reduceEdges(graphs, functions, curves));
+        std::vector<silhouette> outlines = getOutline(graphs, functions, curves, image);
+        displayColoredFunctions(image, pieces);
+        metaData metrics = getData(graphs, image);
+        saveMetadata(outputPath, imagePath.string(), image, graphs,
+                     functions, curves, pieces, outlines, metrics);
+        std::cout << "Saved: " << outputPath << '\n';
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n';
+        return 1;
+    }
     return 0;
 }
 #endif
